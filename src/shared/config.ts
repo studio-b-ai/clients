@@ -79,3 +79,69 @@ export function loadRailwayConfig(): RailwayConfig {
     projectId: optional('RAILWAY_PROJECT_ID'),
   });
 }
+
+/** GoDaddy connection config */
+export const GoDaddyConfigSchema = z.object({
+  apiKey: z.string(),
+  apiSecret: z.string(),
+  env: z.enum(['production', 'ote']).default('production'),
+});
+export type GoDaddyConfig = z.infer<typeof GoDaddyConfigSchema>;
+
+/** Load GoDaddy config from environment */
+export function loadGoDaddyConfig(): GoDaddyConfig {
+  return GoDaddyConfigSchema.parse({
+    apiKey: required('GODADDY_API_KEY'),
+    apiSecret: required('GODADDY_API_SECRET'),
+    env: optional('GODADDY_ENV', 'production'),
+  });
+}
+
+/** Zoom connection config */
+export const ZoomConfigSchema = z.object({
+  accountId: z.string(),
+  clientId: z.string(),
+  clientSecret: z.string(),
+});
+export type ZoomConfig = z.infer<typeof ZoomConfigSchema>;
+
+/** Load Zoom config from environment */
+export function loadZoomConfig(): ZoomConfig {
+  return ZoomConfigSchema.parse({
+    accountId: required('ZOOM_ACCOUNT_ID'),
+    clientId: required('ZOOM_CLIENT_ID'),
+    clientSecret: required('ZOOM_CLIENT_SECRET'),
+  });
+}
+
+/** Microsoft 365 connection config */
+export const MicrosoftConfigSchema = z.object({
+  tenantId: z.string(),
+  clientId: z.string(),
+  clientSecret: z.string(),
+  defaultUserEmail: z.string().optional(),
+});
+export type MicrosoftConfig = z.infer<typeof MicrosoftConfigSchema>;
+
+/** Load Microsoft 365 config from environment */
+export function loadMicrosoftConfig(): MicrosoftConfig {
+  return MicrosoftConfigSchema.parse({
+    tenantId: required('AZURE_TENANT_ID'),
+    clientId: required('AZURE_CLIENT_ID'),
+    clientSecret: required('AZURE_CLIENT_SECRET'),
+    defaultUserEmail: optional('DEFAULT_USER_EMAIL'),
+  });
+}
+
+/** HubSpot connection config */
+export const HubSpotConfigSchema = z.object({
+  accessToken: z.string(),
+});
+export type HubSpotConfig = z.infer<typeof HubSpotConfigSchema>;
+
+/** Load HubSpot config from environment */
+export function loadHubSpotConfig(): HubSpotConfig {
+  return HubSpotConfigSchema.parse({
+    accessToken: required('HUBSPOT_ACCESS_TOKEN'),
+  });
+}
