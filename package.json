@@ -9,6 +9,10 @@
     "./acumatica": "./dist/acumatica/index.js",
     "./github": "./dist/github/index.js",
     "./railway": "./dist/railway/index.js",
+    "./godaddy": "./dist/godaddy/index.js",
+    "./zoom": "./dist/zoom/index.js",
+    "./microsoft": "./dist/microsoft/index.js",
+    "./hubspot": "./dist/hubspot/index.js",
     "./shared/config": "./dist/shared/config.js"
   },
   "scripts": {
