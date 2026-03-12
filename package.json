@@ -8,7 +8,8 @@
     ".": "./dist/index.js",
     "./acumatica": "./dist/acumatica/index.js",
     "./github": "./dist/github/index.js",
-    "./railway": "./dist/railway/index.js"
+    "./railway": "./dist/railway/index.js",
+    "./shared/config": "./dist/shared/config.js"
   },
   "scripts": {
     "build": "tsup",

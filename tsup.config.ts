@@ -6,6 +6,7 @@ export default defineConfig({
     'acumatica/index': 'src/acumatica/index.ts',
     'github/index': 'src/github/index.ts',
     'railway/index': 'src/railway/index.ts',
+    'shared/config': 'src/shared/config.ts',
   },
   format: ['esm'],
   dts: true,
