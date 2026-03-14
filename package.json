@@ -1,5 +1,5 @@
 {
-  "name": "@studiob/clients",
+  "name": "@studio-b-ai/clients",
   "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
@@ -26,6 +26,9 @@
     "pino": "^9.6.0",
     "undici": "^7.3.0",
     "zod": "^3.25.0"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   },
   "devDependencies": {
     "@types/node": "^25.4.0",
