@@ -13,7 +13,10 @@
     "./zoom": "./dist/zoom/index.js",
     "./microsoft": "./dist/microsoft/index.js",
     "./hubspot": "./dist/hubspot/index.js",
-    "./shared/config": "./dist/shared/config.js"
+    "./shared/config": "./dist/shared/config.js",
+    "./acumatica/recipes": "./dist/acumatica/recipes.js",
+    "./hubspot/recipes": "./dist/hubspot/recipes.js",
+    "./zoom/recipes": "./dist/zoom/recipes.js"
   },
   "scripts": {
     "build": "tsup",
