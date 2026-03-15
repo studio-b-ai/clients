@@ -145,3 +145,16 @@ export function loadHubSpotConfig(): HubSpotConfig {
     accessToken: required('HUBSPOT_ACCESS_TOKEN'),
   });
 }
+
+/** Slack connection config */
+export const SlackConfigSchema = z.object({
+  botToken: z.string(),
+});
+export type SlackConfig = z.infer<typeof SlackConfigSchema>;
+
+/** Load Slack config from environment (returns null if no token set) */
+export function loadSlackConfig(): SlackConfig | null {
+  const botToken = process.env.SLACK_BOT_TOKEN || process.env.STUDIOB_SLACK_BOT_TOKEN;
+  if (!botToken) return null;
+  return SlackConfigSchema.parse({ botToken });
+}

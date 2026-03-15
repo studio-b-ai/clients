@@ -46,6 +46,10 @@ export type { MicrosoftClientConfig } from './microsoft/index.js';
 export { HubSpotClient } from './hubspot/index.js';
 export type { HubSpotClientConfig } from './hubspot/index.js';
 
+// Slack
+export { SlackClient } from './slack/index.js';
+export type { SlackClientConfig } from './slack/index.js';
+
 // Shared
 export * from './shared/errors.js';
 export * from './shared/config.js';

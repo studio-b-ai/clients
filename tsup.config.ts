@@ -10,6 +10,7 @@ export default defineConfig({
     'zoom/index': 'src/zoom/index.ts',
     'microsoft/index': 'src/microsoft/index.ts',
     'hubspot/index': 'src/hubspot/index.ts',
+    'slack/index': 'src/slack/index.ts',
     'shared/config': 'src/shared/config.ts',
     'acumatica/recipes': 'src/acumatica/recipes.ts',
     'hubspot/recipes': 'src/hubspot/recipes.ts',

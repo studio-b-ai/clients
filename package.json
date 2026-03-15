@@ -13,6 +13,7 @@
     "./zoom": "./dist/zoom/index.js",
     "./microsoft": "./dist/microsoft/index.js",
     "./hubspot": "./dist/hubspot/index.js",
+    "./slack": "./dist/slack/index.js",
     "./shared/config": "./dist/shared/config.js",
     "./acumatica/recipes": "./dist/acumatica/recipes.js",
     "./hubspot/recipes": "./dist/hubspot/recipes.js",
