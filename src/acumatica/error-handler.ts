@@ -6,6 +6,21 @@
  * Extracted from acumatica-mcp/src/lib/error-handler.ts
  */
 
+/**
+ * Thrown when the Acumatica account is locked out.
+ * Retrying will only extend the lockout — callers must stop immediately.
+ * Unlock via Acumatica SM201010 (Users screen).
+ */
+export class AccountLockedError extends Error {
+  constructor(message?: string) {
+    super(
+      message ??
+        'Acumatica account locked out. Unlock in SM201010 (Users screen).',
+    );
+    this.name = 'AccountLockedError';
+  }
+}
+
 export interface AcumaticaError {
   error: true;
   code: string;
@@ -49,6 +64,13 @@ const ERROR_PATTERNS: ErrorPattern[] = [
     match: (status) => status === 401,
     code: 'SESSION_EXPIRED',
     message: 'Acumatica session expired. Will auto-retry with fresh login.',
+  },
+  {
+    match: (status, body) =>
+      status === 500 && body.includes('locked out'),
+    code: 'ACCOUNT_LOCKED',
+    message:
+      'Acumatica account is locked out. Do NOT retry — unlock in SM201010 (Users screen).',
   },
   {
     match: (status, body) =>

@@ -8,7 +8,7 @@ export {
   SchemaCache,
   val, unwrap, wrap, str, toDateStr, toISOStr,
   guardListExpand, isGetExpandSafe,
-  matchError, genericError, cloudNotSupportedError,
+  matchError, genericError, cloudNotSupportedError, AccountLockedError,
 } from './acumatica/index.js';
 export type {
   AcumaticaClientOptions,

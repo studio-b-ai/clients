@@ -19,7 +19,7 @@ import pino from 'pino';
 import type { Logger } from 'pino';
 import type { AcumaticaConfig } from '../shared/config.js';
 import { wrap, unwrap } from './value-wrapper.js';
-import { matchError, genericError, type AcumaticaError } from './error-handler.js';
+import { matchError, genericError, AccountLockedError, type AcumaticaError } from './error-handler.js';
 
 // -- Call Counter --
 
@@ -208,6 +208,17 @@ export class AcumaticaClient {
         );
 
         if (res.status >= 400) {
+          const isLockedOut =
+            res.status === 500 && res.body.includes('locked out');
+          if (isLockedOut) {
+            this.log.error(
+              'Acumatica account is LOCKED OUT — stopping all login attempts',
+            );
+            throw new AccountLockedError(
+              'Acumatica account locked out. Unlock in SM201010 (Users screen).',
+            );
+          }
+
           const isLoginLimit =
             res.status === 500 && res.body.includes('API Login Limit');
 
@@ -239,6 +250,7 @@ export class AcumaticaClient {
         this.log.debug({ attempt: attempt + 1 }, 'Login successful');
         return;
       } catch (err) {
+        if (err instanceof AccountLockedError) throw err;
         if (attempt >= LOGIN_RETRY_DELAYS.length) throw err;
         const msg = (err as Error).message || '';
         if (!msg.includes('API Login Limit')) throw err;

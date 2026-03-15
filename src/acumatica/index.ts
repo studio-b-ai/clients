@@ -9,6 +9,6 @@ export type { SchemaCacheOptions } from './schema-cache.js';
 export { val, unwrap, wrap, str, toDateStr, toISOStr } from './value-wrapper.js';
 export { guardListExpand, isGetExpandSafe } from './expand-guard.js';
 export type { ExpandGuardResult } from './expand-guard.js';
-export { matchError, genericError, cloudNotSupportedError } from './error-handler.js';
+export { matchError, genericError, cloudNotSupportedError, AccountLockedError } from './error-handler.js';
 export type { AcumaticaError } from './error-handler.js';
 export * as schemas from './schemas.js';
