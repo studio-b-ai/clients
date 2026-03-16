@@ -1,6 +1,20 @@
+import { ApiError, AuthError } from '../shared/errors.js';
+
 export interface SlackClientConfig {
   botToken: string;
 }
+
+export interface SlackMessage {
+  ts: string;
+  channel: string;
+}
+
+export interface SlackChannel {
+  id: string;
+  name: string;
+}
+
+const AUTH_ERRORS = new Set(['invalid_auth', 'token_revoked', 'not_authed', 'account_inactive']);
 
 export class SlackClient {
   private config: SlackClientConfig;
@@ -21,37 +35,49 @@ export class SlackClient {
     });
     if (!res.ok) {
       const errText = await res.text();
-      throw new Error(`Slack ${method}: ${res.status} ${errText.slice(0, 300)}`);
+      throw new ApiError(`Slack ${method}: ${res.status} ${errText.slice(0, 300)}`, res.status, errText);
     }
     const data = (await res.json()) as { ok: boolean; error?: string } & T;
     if (!data.ok) {
-      throw new Error(`Slack ${method}: ${data.error ?? 'unknown error'}`);
+      const error = data.error ?? 'unknown error';
+      if (AUTH_ERRORS.has(error)) {
+        throw new AuthError(`Slack ${method}: ${error}`);
+      }
+      throw new ApiError(`Slack ${method}: ${error}`, 400, { error });
     }
     return data as T;
   }
 
   /** Post a text message to a channel */
-  async postMessage(channel: string, text: string) {
-    return this.call<{ ts: string }>('chat.postMessage', { channel, text });
+  async postMessage(channel: string, text: string): Promise<SlackMessage> {
+    const data = await this.call<{ ts: string; channel: string }>('chat.postMessage', { channel, text });
+    return { ts: data.ts, channel: data.channel };
   }
 
   /** Post Block Kit blocks with fallback text */
-  async postBlockKit(channel: string, text: string, blocks: unknown[]) {
-    return this.call<{ ts: string }>('chat.postMessage', { channel, text, blocks });
+  async postBlockKit(channel: string, text: string, blocks: unknown[]): Promise<SlackMessage> {
+    const data = await this.call<{ ts: string; channel: string }>('chat.postMessage', { channel, text, blocks });
+    return { ts: data.ts, channel: data.channel };
   }
 
   /** Reply in a thread */
-  async replyInThread(channel: string, threadTs: string, text: string) {
-    return this.call<{ ts: string }>('chat.postMessage', { channel, thread_ts: threadTs, text });
+  async replyInThread(channel: string, threadTs: string, text: string): Promise<SlackMessage> {
+    const data = await this.call<{ ts: string; channel: string }>('chat.postMessage', { channel, thread_ts: threadTs, text });
+    return { ts: data.ts, channel: data.channel };
   }
 
   /** Create a public channel */
-  async createChannel(name: string) {
-    return this.call<{ channel: { id: string; name: string } }>('conversations.create', { name });
+  async createChannel(name: string): Promise<SlackChannel> {
+    const data = await this.call<{ channel: { id: string; name: string } }>('conversations.create', { name });
+    return { id: data.channel.id, name: data.channel.name };
   }
 
   /** List public channels */
-  async listChannels() {
-    return this.call<{ channels: Array<{ id: string; name: string }> }>('conversations.list', {});
+  async listChannels(): Promise<SlackChannel[]> {
+    const data = await this.call<{ channels: Array<{ id: string; name: string }> }>('conversations.list', {
+      types: 'public_channel',
+      limit: 1000,
+    });
+    return data.channels.map((ch) => ({ id: ch.id, name: ch.name }));
   }
 }

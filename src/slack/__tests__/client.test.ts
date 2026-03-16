@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { SlackClient } from '../client.js';
+import { ApiError, AuthError } from '../../shared/errors.js';
 
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
@@ -28,7 +29,7 @@ describe('SlackClient', () => {
 
   describe('postMessage', () => {
     it('sends POST to chat.postMessage with correct auth and body', async () => {
-      mockFetch.mockResolvedValueOnce(slackOk({ ts: '1234567890.123456' }));
+      mockFetch.mockResolvedValueOnce(slackOk({ ts: '1234567890.123456', channel: 'C123' }));
 
       const result = await client.postMessage('#general', 'Hello world');
 
@@ -39,14 +40,21 @@ describe('SlackClient', () => {
       expect(opts.headers['Authorization']).toBe('Bearer xoxb-test-token');
       expect(opts.headers['Content-Type']).toBe('application/json');
       expect(JSON.parse(opts.body)).toEqual({ channel: '#general', text: 'Hello world' });
-      expect(result).toEqual({ ok: true, ts: '1234567890.123456' });
+      expect(result).toEqual({ ts: '1234567890.123456', channel: 'C123' });
     });
 
-    it('throws on Slack error response', async () => {
+    it('throws ApiError on Slack error response', async () => {
       mockFetch.mockResolvedValueOnce(slackError('channel_not_found'));
 
       await expect(client.postMessage('#nonexistent', 'test'))
-        .rejects.toThrow('channel_not_found');
+        .rejects.toThrow(ApiError);
+    });
+
+    it('throws AuthError on invalid_auth', async () => {
+      mockFetch.mockResolvedValueOnce(slackError('invalid_auth'));
+
+      await expect(client.postMessage('#general', 'test'))
+        .rejects.toThrow(AuthError);
     });
   });
 
@@ -55,7 +63,7 @@ describe('SlackClient', () => {
       const blocks = [
         { type: 'section', text: { type: 'mrkdwn', text: '*Bold text*' } },
       ];
-      mockFetch.mockResolvedValueOnce(slackOk({ ts: '111.222' }));
+      mockFetch.mockResolvedValueOnce(slackOk({ ts: '111.222', channel: 'C123' }));
 
       await client.postBlockKit('#alerts', 'Fallback text', blocks);
 
@@ -68,7 +76,7 @@ describe('SlackClient', () => {
 
   describe('replyInThread', () => {
     it('sends thread_ts in the request body', async () => {
-      mockFetch.mockResolvedValueOnce(slackOk({ ts: '333.444' }));
+      mockFetch.mockResolvedValueOnce(slackOk({ ts: '333.444', channel: 'C123' }));
 
       await client.replyInThread('#general', '111.222', 'Thread reply');
 
@@ -80,7 +88,7 @@ describe('SlackClient', () => {
   });
 
   describe('createChannel', () => {
-    it('calls conversations.create with channel name', async () => {
+    it('returns unwrapped SlackChannel', async () => {
       mockFetch.mockResolvedValueOnce(slackOk({ channel: { id: 'C123', name: 'new-channel' } }));
 
       const result = await client.createChannel('new-channel');
@@ -89,12 +97,12 @@ describe('SlackClient', () => {
       expect(url).toBe('https://slack.com/api/conversations.create');
       const body = JSON.parse(opts.body);
       expect(body.name).toBe('new-channel');
-      expect(result.channel).toEqual({ id: 'C123', name: 'new-channel' });
+      expect(result).toEqual({ id: 'C123', name: 'new-channel' });
     });
   });
 
   describe('listChannels', () => {
-    it('calls conversations.list with correct params', async () => {
+    it('returns unwrapped SlackChannel array', async () => {
       const channels = [{ id: 'C1', name: 'general' }, { id: 'C2', name: 'random' }];
       mockFetch.mockResolvedValueOnce(slackOk({ channels }));
 
@@ -102,16 +110,26 @@ describe('SlackClient', () => {
 
       const [url] = mockFetch.mock.calls[0];
       expect(url).toBe('https://slack.com/api/conversations.list');
-      expect(result.channels).toEqual(channels);
+      expect(result).toEqual(channels);
+    });
+
+    it('sends types and limit in request body', async () => {
+      mockFetch.mockResolvedValueOnce(slackOk({ channels: [] }));
+
+      await client.listChannels();
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.types).toBe('public_channel');
+      expect(body.limit).toBe(1000);
     });
   });
 
   describe('HTTP error handling', () => {
-    it('throws on non-200 HTTP response', async () => {
+    it('throws ApiError on non-200 HTTP response', async () => {
       mockFetch.mockResolvedValueOnce(new Response('Internal Server Error', { status: 500 }));
 
       await expect(client.postMessage('#general', 'test'))
-        .rejects.toThrow('500');
+        .rejects.toThrow(ApiError);
     });
   });
 });
