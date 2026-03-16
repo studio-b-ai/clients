@@ -294,6 +294,15 @@ export class AcumaticaClient {
     }
   }
 
+  /**
+   * Public login method — ensures the client has an active session.
+   * Delegates to the internal ensureLoggedIn() which handles
+   * session refresh, retry, and concurrent-login dedup.
+   */
+  async login(): Promise<void> {
+    await this.ensureLoggedIn();
+  }
+
   isLoggedIn(): boolean {
     return this.loggedIn;
   }
