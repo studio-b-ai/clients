@@ -91,11 +91,23 @@ export interface AcumaticaClientOptions {
   sessionRefreshMinutes?: number;
   /** Logger instance */
   logger?: Logger;
+  /**
+   * Optional Redis instance for lockout guard coordination.
+   * When provided, the client will:
+   * - Check `acumatica:lockout` before login (skip if locked)
+   * - Set `acumatica:lockout` on AccountLockedError (pause all services)
+   * If not provided, lockout guard is disabled (standalone mode).
+   */
+  redis?: { get(key: string): Promise<string | null>; set(key: string, value: string, ...args: unknown[]): Promise<unknown>; };
 }
 
 // -- Client --
 
 const LOGIN_RETRY_DELAYS = [10_000, 30_000, 60_000];
+
+// Lockout guard constants (shared with webhook-router lockout-guard.ts)
+const LOCKOUT_KEY = 'acumatica:lockout';
+const LOCKOUT_TTL_SECONDS = 600; // 10 minutes
 
 export class AcumaticaClient {
   private baseUrl: string;
@@ -112,6 +124,7 @@ export class AcumaticaClient {
   private sessionRefreshMs: number;
   readonly callCounter = new CallCounter();
   private log: Logger;
+  private redis?: AcumaticaClientOptions['redis'];
 
   constructor(opts: AcumaticaClientOptions) {
     const { config } = opts;
@@ -125,6 +138,7 @@ export class AcumaticaClient {
     this.tenant = config.tenant ?? '';
     this.sessionRefreshMs = (opts.sessionRefreshMinutes ?? 15) * 60 * 1000;
     this.log = opts.logger ?? pino({ name: 'acumatica-client' });
+    this.redis = opts.redis;
     this.agent = new Agent({
       connect: { timeout: opts.requestTimeoutMs ?? 60_000 },
     });
@@ -165,6 +179,16 @@ export class AcumaticaClient {
   // -- Auth --
 
   private async ensureLoggedIn(): Promise<void> {
+    // Check Redis lockout guard before attempting login
+    if (this.redis) {
+      const locked = await this.redis.get(LOCKOUT_KEY).catch(() => null);
+      if (locked) {
+        throw new AccountLockedError(
+          'Acumatica account locked out (Redis guard). Unlock in SM201010 or wait for TTL expiry.',
+        );
+      }
+    }
+
     // Proactive refresh near expiry
     if (this.loggedIn && Date.now() - this.sessionStart > this.sessionRefreshMs) {
       this.log.debug('Session near expiry, refreshing');
@@ -214,6 +238,15 @@ export class AcumaticaClient {
             this.log.error(
               'Acumatica account is LOCKED OUT — stopping all login attempts',
             );
+            // Set Redis lockout flag so all services stop attempting login
+            if (this.redis) {
+              await this.redis.set(
+                LOCKOUT_KEY,
+                new Date().toISOString(),
+                'EX',
+                LOCKOUT_TTL_SECONDS,
+              ).catch((e) => this.log.warn({ err: (e as Error).message }, 'Failed to set Redis lockout flag'));
+            }
             throw new AccountLockedError(
               'Acumatica account locked out. Unlock in SM201010 (Users screen).',
             );
