@@ -30,11 +30,11 @@ export class CallCounter {
   perDay = 0;
   private hourStart = Date.now();
   private dayStart = Date.now();
-  readonly budgets = {
-    perCycle: 200,
-    perHour: 500,
-    perDay: 3000,
-  };
+  readonly budgets: { perCycle: number; perHour: number; perDay: number };
+
+  constructor(budgets?: { perCycle: number; perHour: number; perDay: number }) {
+    this.budgets = budgets ?? { perCycle: 200, perHour: 500, perDay: 3000 };
+  }
 
   private rollover() {
     const now = Date.now();
@@ -92,6 +92,8 @@ export interface AcumaticaClientOptions {
   sessionRefreshMinutes?: number;
   /** Logger instance */
   logger?: Logger;
+  /** API call budget overrides (per-cycle/hour/day limits) */
+  budget?: { perCycle: number; perHour: number; perDay: number };
   /**
    * Optional Redis instance for lockout guard coordination.
    * When provided, the client will:
@@ -123,7 +125,7 @@ export class AcumaticaClient {
   private loginPromise: Promise<void> | null = null;
   private agent: Agent;
   private sessionRefreshMs: number;
-  readonly callCounter = new CallCounter();
+  readonly callCounter: CallCounter;
   private log: Logger;
   private redis?: AcumaticaClientOptions['redis'];
 
@@ -142,6 +144,7 @@ export class AcumaticaClient {
     this.tenant = config.tenant ?? '';
     this.sessionRefreshMs = (opts.sessionRefreshMinutes ?? 15) * 60 * 1000;
     this.log = opts.logger ?? pino({ name: 'acumatica-client' });
+    this.callCounter = new CallCounter(opts.budget);
     this.redis = opts.redis;
     this.agent = new Agent({
       connect: { timeout: opts.requestTimeoutMs ?? 60_000 },
