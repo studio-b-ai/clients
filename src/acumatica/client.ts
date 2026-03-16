@@ -20,6 +20,7 @@ import type { Logger } from 'pino';
 import type { AcumaticaConfig } from '../shared/config.js';
 import { wrap, unwrap } from './value-wrapper.js';
 import { matchError, genericError, AccountLockedError, type AcumaticaError } from './error-handler.js';
+import { AcumaticaCircuitBreaker, CircuitOpenError } from './circuit-breaker.js';
 
 // -- Call Counter --
 
@@ -126,6 +127,9 @@ export class AcumaticaClient {
   private log: Logger;
   private redis?: AcumaticaClientOptions['redis'];
 
+  /** Optional circuit breaker — trips on lockout, blocks all requests until cooldown. */
+  circuitBreaker?: AcumaticaCircuitBreaker;
+
   constructor(opts: AcumaticaClientOptions) {
     const { config } = opts;
     const endpoint = opts.endpoint ?? 'default';
@@ -179,6 +183,7 @@ export class AcumaticaClient {
   // -- Auth --
 
   private async ensureLoggedIn(): Promise<void> {
+<<<<<<< HEAD
     // Check Redis lockout guard before attempting login
     if (this.redis) {
       const locked = await this.redis.get(LOCKOUT_KEY).catch(() => null);
@@ -187,6 +192,14 @@ export class AcumaticaClient {
           'Acumatica account locked out (Redis guard). Unlock in SM201010 or wait for TTL expiry.',
         );
       }
+=======
+    // Circuit breaker check — block all requests while open
+    if (this.circuitBreaker?.isOpen) {
+      throw new CircuitOpenError(
+        this.circuitBreaker.reason,
+        this.circuitBreaker.retryAfterSeconds,
+      );
+>>>>>>> 97285f2 (feat(clients): add Acumatica lockout circuit breaker)
     }
 
     // Proactive refresh near expiry
@@ -208,6 +221,10 @@ export class AcumaticaClient {
     this.loginPromise = this.loginWithRetry();
     try {
       await this.loginPromise;
+    } catch (err) {
+      // Trip circuit breaker on login failure
+      this.circuitBreaker?.onError(err as Error);
+      throw err;
     } finally {
       this.loggingIn = false;
       this.loginPromise = null;
@@ -367,6 +384,7 @@ export class AcumaticaClient {
       return this.handleError(res.status, res.body, url.toString());
     }
 
+    this.circuitBreaker?.onSuccess();
     return unwrap(JSON.parse(res.body));
   }
 
@@ -396,6 +414,7 @@ export class AcumaticaClient {
       return this.handleError(res.status, res.body, url);
     }
 
+    this.circuitBreaker?.onSuccess();
     return unwrap(JSON.parse(res.body));
   }
 
@@ -426,6 +445,7 @@ export class AcumaticaClient {
       return this.handleError(res.status, res.body, url);
     }
 
+    this.circuitBreaker?.onSuccess();
     const respBody = res.body.trim();
     return respBody ? unwrap(JSON.parse(respBody)) : { success: true };
   }
@@ -455,6 +475,7 @@ export class AcumaticaClient {
       return this.handleError(res.status, res.body, url);
     }
 
+    this.circuitBreaker?.onSuccess();
     return { success: true };
   }
 
