@@ -183,7 +183,14 @@ export class AcumaticaClient {
   // -- Auth --
 
   private async ensureLoggedIn(): Promise<void> {
-<<<<<<< HEAD
+    // Circuit breaker check — block all requests while open
+    if (this.circuitBreaker?.isOpen) {
+      throw new CircuitOpenError(
+        this.circuitBreaker.reason,
+        this.circuitBreaker.retryAfterSeconds,
+      );
+    }
+
     // Check Redis lockout guard before attempting login
     if (this.redis) {
       const locked = await this.redis.get(LOCKOUT_KEY).catch(() => null);
@@ -192,14 +199,6 @@ export class AcumaticaClient {
           'Acumatica account locked out (Redis guard). Unlock in SM201010 or wait for TTL expiry.',
         );
       }
-=======
-    // Circuit breaker check — block all requests while open
-    if (this.circuitBreaker?.isOpen) {
-      throw new CircuitOpenError(
-        this.circuitBreaker.reason,
-        this.circuitBreaker.retryAfterSeconds,
-      );
->>>>>>> 97285f2 (feat(clients): add Acumatica lockout circuit breaker)
     }
 
     // Proactive refresh near expiry
