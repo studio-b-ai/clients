@@ -391,6 +391,55 @@ export class AcumaticaClient {
   }
 
   /**
+   * GET OData endpoint for Generic Inquiries.
+   * GI OData is at /odata/{giName}, NOT /entity/.../{giName}.
+   * Uses the same session cookie as the entity API.
+   */
+  async getOData(
+    giName: string,
+    params?: Record<string, string | number>,
+  ): Promise<unknown> {
+    await this.ensureLoggedIn();
+    this.callCounter.tick();
+    if (this.callCounter.isOverBudget()) {
+      throw new Error(
+        `API call budget exceeded: ${JSON.stringify(this.callCounter.stats())}`,
+      );
+    }
+
+    const url = new URL(`${this.baseUrl}/odata/${giName}`);
+    if (params) {
+      for (const [k, v] of Object.entries(params)) {
+        url.searchParams.set(k, String(v));
+      }
+    }
+
+    const res = await this.httpRequest('GET', url.toString());
+
+    if (res.status === 401) {
+      this.log.warn('OData session expired, re-authenticating');
+      this.loggedIn = false;
+      this.cookies = '';
+      await this.ensureLoggedIn();
+      const retry = await this.httpRequest('GET', url.toString());
+      if (retry.status >= 400) {
+        return this.handleError(retry.status, retry.body, url.toString());
+      }
+      const json = JSON.parse(retry.body);
+      return json.value ?? json;
+    }
+
+    if (res.status >= 400) {
+      return this.handleError(res.status, res.body, url.toString());
+    }
+
+    this.circuitBreaker?.onSuccess();
+    const json = JSON.parse(res.body);
+    // OData wraps results in { value: [...] }
+    return json.value ?? json;
+  }
+
+  /**
    * PUT entity endpoint (create or update). Auto-wraps input, unwraps response.
    */
   async put(path: string, body: Record<string, unknown>): Promise<unknown> {
