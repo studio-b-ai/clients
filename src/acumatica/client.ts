@@ -407,7 +407,11 @@ export class AcumaticaClient {
       );
     }
 
-    const url = new URL(`${this.baseUrl}/odata/${giName}`);
+    // Include company/tenant in OData path if configured (required on multi-company instances)
+    const odataPath = this.tenant
+      ? `/odata/${encodeURIComponent(this.tenant)}/${giName}`
+      : `/odata/${giName}`;
+    const url = new URL(`${this.baseUrl}${odataPath}`);
     if (params) {
       for (const [k, v] of Object.entries(params)) {
         url.searchParams.set(k, String(v));
