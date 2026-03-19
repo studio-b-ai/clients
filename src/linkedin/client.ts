@@ -41,7 +41,7 @@ export class LinkedInClient {
 
   constructor(config: LinkedInClientConfig) {
     this.accessToken = config.accessToken;
-    this.apiVersion = config.apiVersion ?? '202401';
+    this.apiVersion = config.apiVersion ?? '202602';
   }
 
   /**
@@ -145,6 +145,17 @@ export class LinkedInClient {
       throw new Error('LinkedIn resharePost: missing x-restli-id header in response');
     }
     return { postUrn };
+  }
+
+  /**
+   * Get basic info about a LinkedIn organization (company page).
+   */
+  async getOrganizationInfo(orgUrn: string): Promise<{ localizedName: string }> {
+    // Extract numeric ID from URN like "urn:li:organization:12345"
+    const id = orgUrn.includes(':') ? orgUrn.split(':').pop()! : orgUrn;
+    const res = await this.request(`/rest/organizations/${id}`);
+    const data = await res.json() as { localizedName: string };
+    return { localizedName: data.localizedName };
   }
 
   /**

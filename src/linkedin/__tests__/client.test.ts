@@ -43,7 +43,7 @@ describe('LinkedInClient', () => {
       expect(url).toBe('https://api.linkedin.com/rest/posts');
       expect(opts.method).toBe('POST');
       expect(opts.headers.Authorization).toBe('Bearer test-token');
-      expect(opts.headers['LinkedIn-Version']).toBe('202401');
+      expect(opts.headers['LinkedIn-Version']).toBe('202602');
       expect(opts.headers['X-Restli-Protocol-Version']).toBe('2.0.0');
 
       const body = JSON.parse(opts.body);
