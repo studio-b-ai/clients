@@ -50,6 +50,11 @@ export type { HubSpotClientConfig } from './hubspot/index.js';
 export { SlackClient } from './slack/index.js';
 export type { SlackClientConfig } from './slack/index.js';
 
+// LinkedIn
+export { LinkedInClient, LinkedInAuth } from './linkedin/index.js';
+export type { LinkedInClientConfig, LinkedInAuthConfig, LinkedInTokenResponse } from './linkedin/index.js';
+
 // Shared
 export * from './shared/errors.js';
 export * from './shared/config.js';
+export * from './shared/encryption.js';

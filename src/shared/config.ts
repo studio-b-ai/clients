@@ -158,3 +158,20 @@ export function loadSlackConfig(): SlackConfig | null {
   if (!botToken) return null;
   return SlackConfigSchema.parse({ botToken });
 }
+
+/** LinkedIn connection config */
+export const LinkedInConfigSchema = z.object({
+  clientId: z.string(),
+  clientSecret: z.string(),
+  redirectUri: z.string().url().default('https://studiob-api-production.up.railway.app/api/v1/linkedin/callback'),
+});
+export type LinkedInConfig = z.infer<typeof LinkedInConfigSchema>;
+
+/** Load LinkedIn config from environment */
+export function loadLinkedInConfig(): LinkedInConfig {
+  return LinkedInConfigSchema.parse({
+    clientId: required('LINKEDIN_CLIENT_ID'),
+    clientSecret: required('LINKEDIN_CLIENT_SECRET'),
+    redirectUri: optional('LINKEDIN_REDIRECT_URI', 'https://studiob-api-production.up.railway.app/api/v1/linkedin/callback'),
+  });
+}

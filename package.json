@@ -14,7 +14,9 @@
     "./microsoft": "./dist/microsoft/index.js",
     "./hubspot": "./dist/hubspot/index.js",
     "./slack": "./dist/slack/index.js",
+    "./linkedin": "./dist/linkedin/index.js",
     "./shared/config": "./dist/shared/config.js",
+    "./shared/encryption": "./dist/shared/encryption.js",
     "./acumatica/recipes": "./dist/acumatica/recipes.js",
     "./hubspot/recipes": "./dist/hubspot/recipes.js",
     "./zoom/recipes": "./dist/zoom/recipes.js"
