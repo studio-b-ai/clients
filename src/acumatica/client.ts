@@ -111,6 +111,9 @@ const LOGIN_RETRY_DELAYS = [10_000, 30_000, 60_000];
 // Lockout guard constants (shared with webhook-router lockout-guard.ts)
 const LOCKOUT_KEY = 'acumatica:lockout';
 const LOCKOUT_TTL_SECONDS = 600; // 10 minutes
+const LOGIN_FAILURES_KEY = 'acumatica:login-failures';
+const LOGIN_BUDGET_TTL_SECONDS = 1800; // 30-min sliding window
+const LOGIN_BUDGET_MAX = 1; // Trip guard after this many failures
 
 export class AcumaticaClient {
   private baseUrl: string;
@@ -213,6 +216,9 @@ export class AcumaticaClient {
 
     if (this.loggedIn) return;
 
+    // Check login budget before attempting — trips guard preemptively
+    await this.checkLoginBudget();
+
     // Prevent concurrent login attempts -- reuse in-flight promise
     if (this.loggingIn && this.loginPromise) {
       await this.loginPromise;
@@ -283,6 +289,7 @@ export class AcumaticaClient {
             await new Promise((r) => setTimeout(r, delay));
             continue;
           }
+          await this.recordLoginFailure();
           throw new Error(
             `Login failed: HTTP ${res.status} -- ${res.body.slice(0, 200)}`,
           );
@@ -341,6 +348,50 @@ export class AcumaticaClient {
     this.loggedIn = false;
     this.cookies = '';
     this.sessionStart = 0;
+  }
+
+  // -- Login budget --
+
+  /**
+   * Check if login attempt budget is exhausted.
+   * Throws if too many recent failures — trips the lockout guard
+   * BEFORE Acumatica's own lockout threshold (typically 3-5 attempts).
+   */
+  private async checkLoginBudget(): Promise<void> {
+    if (!this.redis) return;
+    try {
+      const count = await this.redis.get(LOGIN_FAILURES_KEY);
+      if (count && parseInt(count, 10) > LOGIN_BUDGET_MAX) {
+        await this.redis.set(
+          LOCKOUT_KEY,
+          `${new Date().toISOString()} | Login budget exhausted (${count} failures in 30min)`,
+          'EX',
+          LOCKOUT_TTL_SECONDS,
+        ).catch(() => {});
+        throw new AccountLockedError(
+          `Login attempt budget exhausted — ${count} failures in 30-min window. Guard tripped preemptively.`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof AccountLockedError) throw err;
+      this.log.warn({ err: (err as Error).message }, 'Login budget check failed (non-fatal)');
+    }
+  }
+
+  /**
+   * Record a login failure. After LOGIN_BUDGET_MAX failures in a 30-min
+   * window, checkLoginBudget() will trip the lockout guard.
+   */
+  private async recordLoginFailure(): Promise<void> {
+    if (!this.redis) return;
+    try {
+      const current = await this.redis.get(LOGIN_FAILURES_KEY);
+      const next = current ? parseInt(current, 10) + 1 : 1;
+      await this.redis.set(LOGIN_FAILURES_KEY, String(next), 'EX', LOGIN_BUDGET_TTL_SECONDS);
+      this.log.warn({ failures: next, budget: LOGIN_BUDGET_MAX }, 'Login failure recorded');
+    } catch (err) {
+      this.log.warn({ err: (err as Error).message }, 'Failed to record login failure (non-fatal)');
+    }
   }
 
   // -- API methods --
