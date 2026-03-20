@@ -11,6 +11,7 @@ export default defineConfig({
     'microsoft/index': 'src/microsoft/index.ts',
     'hubspot/index': 'src/hubspot/index.ts',
     'slack/index': 'src/slack/index.ts',
+    'linkedin/index': 'src/linkedin/index.ts',
     'shared/config': 'src/shared/config.ts',
     'acumatica/recipes': 'src/acumatica/recipes.ts',
     'hubspot/recipes': 'src/hubspot/recipes.ts',
