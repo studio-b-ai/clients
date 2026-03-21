@@ -1,1 +1,49 @@
-ewogICJuYW1lIjogIkBzdHVkaW8tYi1haS9jbGllbnRzIiwKICAidmVyc2lvbiI6ICIwLjEuNCIsCiAgInR5cGUiOiAibW9kdWxlIiwKICAibWFpbiI6ICIuL2Rpc3QvaW5kZXguanMiLAogICJ0eXBlcyI6ICIuL2Rpc3QvaW5kZXguZC50cyIsCiAgImV4cG9ydHMiOiB7CiAgICAiLiI6ICIuL2Rpc3QvaW5kZXguanMiLAogICAgIi4vYWN1bWF0aWNhIjogIi4vZGlzdC9hY3VtYXRpY2EvaW5kZXguanMiLAogICAgIi4vZ2l0aHViIjogIi4vZGlzdC9naXRodWIvaW5kZXguanMiLAogICAgIi4vcmFpbHdheSI6ICIuL2Rpc3QvcmFpbHdheS9pbmRleC5qcyIsCiAgICAiLi9nb2RhZGR5IjogIi4vZGlzdC9nb2RhZGR5L2luZGV4LmpzIiwKICAgICIuL3pvb20iOiAiLi9kaXN0L3pvb20vaW5kZXguanMiLAogICAgIi4vbWljcm9zb2Z0IjogIi4vZGlzdC9taWNyb3NvZnQvaW5kZXguanMiLAogICAgIi4vaHVic3BvdCI6ICIuL2Rpc3QvaHVic3BvdC9pbmRleC5qcyIsCiAgICAiLi9zbGFjayI6ICIuL2Rpc3Qvc2xhY2svaW5kZXguanMiLAogICAgIi4vbGlua2VkaW4iOiAiLi9kaXN0L2xpbmtlZGluL2luZGV4LmpzIiwKICAgICIuL3NoYXJlZC9jb25maWciOiAiLi9kaXN0L3NoYXJlZC9jb25maWcuanMiLAogICAgIi4vc2hhcmVkL2VuY3J5cHRpb24iOiAiLi9kaXN0L3NoYXJlZC9lbmNyeXB0aW9uLmpzIiwKICAgICIuL2FjdW1hdGljYS9yZWNpcGVzIjogIi4vZGlzdC9hY3VtYXRpY2EvcmVjaXBlcy5qcyIsCiAgICAiLi9odWJzcG90L3JlY2lwZXMiOiAiLi9kaXN0L2h1YnNwb3QvcmVjaXBlcy5qcyIsCiAgICAiLi96b29tL3JlY2lwZXMiOiAiLi9kaXN0L3pvb20vcmVjaXBlcy5qcyIKICB9LAogICJmaWxlcyI6IFsKICAgICJkaXN0IiwKICAgICJwYWNrYWdlLmpzb24iCiAgXSwKICAic2NyaXB0cyI6IHsKICAgICJidWlsZCI6ICJ0c3VwIiwKICAgICJkZXYiOiAidHN1cCAtLXdhdGNoIiwKICAgICJ0ZXN0IjogInZpdGVzdCBydW4iLAogICAgImNsZWFuIjogInJtIC1yZiBkaXN0IgogIH0sCiAgImRlcGVuZGVuY2llcyI6IHsKICAgICJpb3JlZGlzIjogIl41LjQuMiIsCiAgICAicGlubyI6ICJeOS42LjAiLAogICAgInVuZGljaSI6ICJeNy4zLjAiLAogICAgInpvZCI6ICJeMy4yNS4wIgogIH0sCiAgInB1Ymxpc2hDb25maWciOiB7CiAgICAicmVnaXN0cnkiOiAiaHR0cHM6Ly9ucG0ucGtnLmdpdGh1Yi5jb20iCiAgfSwKICAiZGV2RGVwZW5kZW5jaWVzIjogewogICAgIkB0eXBlcy9ub2RlIjogIl4yNS40LjAiLAogICAgInRzdXAiOiAiXjguNC4wIiwKICAgICJ0eXBlc2NyaXB0IjogIl41LjcuMCIsCiAgICAidml0ZXN0IjogIl4zLjAuMCIKICB9Cn0K
+{
+  "name": "@studio-b-ai/clients",
+  "version": "0.1.4",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./acumatica": "./dist/acumatica/index.js",
+    "./github": "./dist/github/index.js",
+    "./railway": "./dist/railway/index.js",
+    "./godaddy": "./dist/godaddy/index.js",
+    "./zoom": "./dist/zoom/index.js",
+    "./microsoft": "./dist/microsoft/index.js",
+    "./hubspot": "./dist/hubspot/index.js",
+    "./slack": "./dist/slack/index.js",
+    "./linkedin": "./dist/linkedin/index.js",
+    "./shared/config": "./dist/shared/config.js",
+    "./shared/encryption": "./dist/shared/encryption.js",
+    "./acumatica/recipes": "./dist/acumatica/recipes.js",
+    "./hubspot/recipes": "./dist/hubspot/recipes.js",
+    "./zoom/recipes": "./dist/zoom/recipes.js"
+  },
+  "files": [
+    "dist",
+    "package.json"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.2",
+    "pino": "^9.6.0",
+    "undici": "^7.3.0",
+    "zod": "^3.25.0"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
