@@ -93,11 +93,20 @@ export function wrap(obj: unknown): unknown {
   if (typeof obj === 'object') {
     const record = obj as Record<string, unknown>;
     const result: Record<string, unknown> = {};
+
+    // Fields that Acumatica expects as raw values (NOT wrapped in {value:})
+    const RAW_FIELDS = new Set(['id', 'delete', 'rowNumber', 'note', 'custom', '_links']);
+
     for (const [key, value] of Object.entries(record)) {
+      // Pass-through fields: Acumatica expects these as raw values
+      if (RAW_FIELDS.has(key)) {
+        result[key] = value;
+        continue;
+      }
       if (value === null || value === undefined) {
         result[key] = { value: null };
       } else if (Array.isArray(value)) {
-        // Arrays (like Attributes) are wrapped element-by-element
+        // Arrays (like Attributes, Details, Allocations) are wrapped element-by-element
         result[key] = value.map(wrap);
       } else if (typeof value === 'object') {
         // Already wrapped {value: x} or nested object -- check
