@@ -495,6 +495,37 @@ export class AcumaticaClient {
   }
 
   /**
+   * PUT entity endpoint with a pre-wrapped body (no auto-wrap).
+   * Use this when the body contains metadata fields like `id` or `delete`
+   * that must NOT be wrapped in {value: x} format.
+   */
+  async putRaw(path: string, body: Record<string, unknown>): Promise<unknown> {
+    await this.ensureLoggedIn();
+    this.callCounter.tick();
+
+    const url = `${this.apiBase}/${path}`;
+    const res = await this.httpRequest('PUT', url, body);
+
+    if (res.status === 401) {
+      this.loggedIn = false;
+      this.cookies = '';
+      await this.ensureLoggedIn();
+      const retry = await this.httpRequest('PUT', url, body);
+      if (retry.status >= 400) {
+        return this.handleError(retry.status, retry.body, url);
+      }
+      return unwrap(JSON.parse(retry.body));
+    }
+
+    if (res.status >= 400) {
+      return this.handleError(res.status, res.body, url);
+    }
+
+    this.circuitBreaker?.onSuccess();
+    return unwrap(JSON.parse(res.body));
+  }
+
+  /**
    * PUT entity endpoint (create or update). Auto-wraps input, unwraps response.
    */
   async put(path: string, body: Record<string, unknown>): Promise<unknown> {
