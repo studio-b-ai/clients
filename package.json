@@ -32,6 +32,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "fast-xml-parser": "^5.5.8",
     "ioredis": "^5.4.2",
     "pino": "^9.6.0",
     "undici": "^7.3.0",
