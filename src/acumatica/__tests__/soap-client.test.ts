@@ -74,7 +74,7 @@ const SCHEMA_SUCCESS_BODY = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
     <GetSchemaResponse xmlns="http://www.acumatica.com/typed/">
-      <GetSchemaResult><Screen><ObjectName>OrderSummary</ObjectName></Screen></GetSchemaResult>
+      <GetSchemaResult><Screen><ObjectName>Document</ObjectName></Screen></GetSchemaResult>
     </GetSchemaResponse>
   </soap:Body>
 </soap:Envelope>`;
@@ -165,8 +165,8 @@ describe('SoapClient', () => {
       );
 
       const commands: SoapCommand[] = [
-        { fieldName: 'OrderType', objectName: 'OrderSummary', value: 'SO', commit: true },
-        { fieldName: 'OrderNbr', objectName: 'OrderSummary', value: '000123' },
+        { fieldName: 'OrderType', objectName: 'Document', value: 'SO', commit: true },
+        { fieldName: 'OrderNbr', objectName: 'Document', value: '000123' },
       ];
 
       await client.submit('SO301000', commands);
@@ -178,7 +178,7 @@ describe('SoapClient', () => {
       expect(opts.headers['Cookie']).toBe('.ASPXAUTH=abc123');
       // Check command XML
       expect(opts.body).toContain('<FieldName>OrderType</FieldName>');
-      expect(opts.body).toContain('<ObjectName>OrderSummary</ObjectName>');
+      expect(opts.body).toContain('<ObjectName>Document</ObjectName>');
       expect(opts.body).toContain('<Value>SO</Value>');
       expect(opts.body).toContain('<Commit>true</Commit>');
       expect(opts.body).toContain('<FieldName>OrderNbr</FieldName>');
@@ -201,7 +201,7 @@ describe('SoapClient', () => {
 
       await expect(
         client.submit('SO301000', [
-          { fieldName: 'OrderNbr', objectName: 'OrderSummary', value: 'INVALID' },
+          { fieldName: 'OrderNbr', objectName: 'Document', value: 'INVALID' },
         ]),
       ).rejects.toThrow('SOAP Submit fault: Record not found');
     });
@@ -269,7 +269,7 @@ describe('SoapClient', () => {
       const result = await client.getSchema('SO301000');
 
       expect(result).toContain('GetSchemaResult');
-      expect(result).toContain('OrderSummary');
+      expect(result).toContain('Document');
       const [, opts] = mockRequest.mock.calls[0]!;
       expect(opts.headers.SOAPAction).toBe('"http://www.acumatica.com/typed/GetSchema"');
     });

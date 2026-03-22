@@ -38,7 +38,7 @@ export interface SoapClientConfig {
 export interface SoapCommand {
   /** Field name on the screen (e.g. "OrderType", "OrderNbr"). */
   fieldName: string;
-  /** Object/view name on the screen (e.g. "OrderSummary", "DocumentDetails"). */
+  /** Object/view name on the screen (e.g. "Document", "Transactions"). */
   objectName: string;
   /** Value to set. Omit for actions like Save. */
   value?: string;
@@ -269,19 +269,19 @@ export class SoapClient {
 
       const commands: SoapCommand[] = [
         // Load the order
-        { fieldName: 'OrderType', objectName: 'OrderSummary', value: orderType, commit: true },
-        { fieldName: 'OrderNbr', objectName: 'OrderSummary', value: orderNbr, commit: true },
+        { fieldName: 'OrderType', objectName: 'Document', value: orderType, commit: true },
+        { fieldName: 'OrderNbr', objectName: 'Document', value: orderNbr, commit: true },
         // Select the line
-        { fieldName: 'LineNbr', objectName: 'DocumentDetails', value: lineNbr, commit: true },
+        { fieldName: 'LineNbr', objectName: 'Transactions', value: lineNbr, commit: true },
         // Set lot serial number
-        { fieldName: 'LotSerialNbr', objectName: 'DocumentDetails', value: lot.lotSerialNbr, commit: true },
+        { fieldName: 'LotSerialNbr', objectName: 'Transactions', value: lot.lotSerialNbr, commit: true },
       ];
 
       // If quantity specified, set it too
       if (lot.quantity !== undefined) {
         commands.push({
           fieldName: 'Quantity',
-          objectName: 'DocumentDetails',
+          objectName: 'Transactions',
           value: String(lot.quantity),
           commit: true,
         });
@@ -290,7 +290,7 @@ export class SoapClient {
       // Save the order
       commands.push({
         fieldName: 'Save',
-        objectName: 'OrderSummary',
+        objectName: 'Document',
         commit: true,
       });
 
