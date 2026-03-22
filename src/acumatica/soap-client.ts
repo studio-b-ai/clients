@@ -68,14 +68,13 @@ export interface AllocateLotResult {
 // ---------------------------------------------------------------------------
 
 function buildLoginXml(username: string, password: string, tenant?: string): string {
-  const companyAttr = tenant ? ` companyName="${escapeXml(tenant)}"` : '';
   return `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
     <Login xmlns="http://www.acumatica.com/typed/">
       <name>${escapeXml(username)}</name>
       <password>${escapeXml(password)}</password>
-      <company${companyAttr} />
+      ${tenant ? `<company>${escapeXml(tenant)}</company>` : ''}
     </Login>
   </soap:Body>
 </soap:Envelope>`;
@@ -347,8 +346,11 @@ export class SoapClient {
     const text = await res.body.text();
 
     if (res.statusCode >= 400) {
-      this.log.error({ url, operation, status: res.statusCode, body: text.slice(0, 500) }, 'SOAP HTTP error');
-      throw new Error(`SOAP ${operation} failed with HTTP ${res.statusCode}`);
+      // Try to extract fault message from SOAP response
+      const faultMatch = text.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/);
+      const faultMsg = faultMatch?.[1]?.replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&') ?? '';
+      this.log.error({ url, operation, status: res.statusCode, fault: faultMsg || text.slice(0, 500) }, 'SOAP HTTP error');
+      throw new Error(`SOAP ${operation} failed (HTTP ${res.statusCode}): ${faultMsg || text.slice(0, 300)}`);
     }
 
     return {

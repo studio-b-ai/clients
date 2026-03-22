@@ -124,7 +124,7 @@ describe('SoapClient', () => {
       // Body should contain credentials
       expect(opts.body).toContain('<name>admin</name>');
       expect(opts.body).toContain('<password>secret</password>');
-      expect(opts.body).toContain('companyName="TestCo"');
+      expect(opts.body).toContain('<company>TestCo</company>');
     });
 
     it('throws when no cookie is returned', async () => {
@@ -142,7 +142,7 @@ describe('SoapClient', () => {
         mockResponse(401, 'Unauthorized', {}),
       );
 
-      await expect(client.login('SO301000')).rejects.toThrow('SOAP Login failed with HTTP 401');
+      await expect(client.login('SO301000')).rejects.toThrow('SOAP Login failed (HTTP 401)');
     });
   });
 
