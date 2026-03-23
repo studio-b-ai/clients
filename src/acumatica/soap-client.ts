@@ -34,6 +34,15 @@ export interface SoapClientConfig {
   logger?: Logger;
 }
 
+/**
+ * SOAP Screen API command types (from WSDL):
+ *   - Value:  SET a field value (write)
+ *   - Field:  READ a field value (return in response)
+ *   - Action: Trigger screen action (Save, Delete, Cancel)
+ *   - Key:    Navigate using key field
+ */
+export type SoapCommandType = 'Value' | 'Field' | 'Action' | 'Key';
+
 /** A single SOAP Screen API command (field set or action trigger). */
 export interface SoapCommand {
   /** Field name on the screen (e.g. "OrderType", "OrderNbr"). */
@@ -46,6 +55,8 @@ export interface SoapCommand {
   commit?: boolean;
   /** Linked command reference name (rarely needed). */
   linkedCommand?: string;
+  /** SOAP command type. Default: 'Value' for commands with value, 'Action' for Save/Delete/Cancel. */
+  type?: SoapCommandType;
 }
 
 /** Parameters for the allocateLot high-level method. */
@@ -101,8 +112,17 @@ function buildGetSchemaXml(): string {
 function buildSubmitXml(commands: SoapCommand[]): string {
   const commandsXml = commands
     .map((cmd) => {
+      // Determine xsi:type from WSDL types:
+      //   Value  = set a field value (write)
+      //   Field  = read a field value
+      //   Action = trigger screen action (Save, Delete, Cancel)
+      //   Key    = navigate using key field
+      const ACTION_FIELDS = new Set(['Save', 'Cancel', 'Delete', 'Insert', 'First', 'Last', 'Next', 'Prev']);
+      const xsiType = cmd.type
+        ?? (ACTION_FIELDS.has(cmd.fieldName) ? 'Action' : 'Value');
+
       const parts: string[] = [];
-      parts.push(`      <Command xsi:type="Field" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">`);
+      parts.push(`      <Command xsi:type="${xsiType}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">`);
       parts.push(`        <FieldName>${escapeXml(cmd.fieldName)}</FieldName>`);
       parts.push(`        <ObjectName>${escapeXml(cmd.objectName)}</ObjectName>`);
       if (cmd.value !== undefined) {
