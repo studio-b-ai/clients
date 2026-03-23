@@ -239,9 +239,13 @@ export class SoapClient {
    *   2. Load the order (OrderType + OrderNbr with commit)
    *   3. Select the line (LineNbr with commit)
    *   4. Set LotSerialNbr (with commit)
-   *   5. Optionally set Quantity
-   *   6. Save
-   *   7. Logout
+   *   5. Save (NO commit — action, not field value)
+   *   6. Logout
+   *
+   *   IMPORTANT: Do NOT set Quantity alongside LotSerialNbr — causes
+   *   Acumatica to re-evaluate splits and discard the lot assignment.
+   *   Same pattern as REST API: "Do NOT include OrderQty in same PUT
+   *   as Allocations."
    *
    * Currently supports single-lot only.
    * TODO: Multi-lot requires accessing the Allocations split view.
@@ -273,32 +277,18 @@ export class SoapClient {
         { fieldName: 'OrderNbr', objectName: 'Document', value: orderNbr, commit: true },
         // Select the line
         { fieldName: 'LineNbr', objectName: 'Transactions', value: lineNbr, commit: true },
-        // Set lot serial number
+        // Set lot serial number — do NOT set Quantity here (causes lot discard)
         { fieldName: 'LotSerialNbr', objectName: 'Transactions', value: lot.lotSerialNbr, commit: true },
+        // Save — no commit flag (it's an action, not a field value)
+        { fieldName: 'Save', objectName: 'Document' },
       ];
 
-      // If quantity specified, set it too
-      if (lot.quantity !== undefined) {
-        commands.push({
-          fieldName: 'Quantity',
-          objectName: 'Transactions',
-          value: String(lot.quantity),
-          commit: true,
-        });
-      }
+      const responseXml = await this.submit(screenID, commands);
 
-      // Save the order
-      commands.push({
-        fieldName: 'Save',
-        objectName: 'Document',
-        commit: true,
-      });
-
-      await this.submit(screenID, commands);
-
+      // Log response snippet for debugging persistence issues
       this.log.info(
-        { orderType, orderNbr, lineNbr, lotSerialNbr: lot.lotSerialNbr },
-        'Lot allocated successfully',
+        { orderType, orderNbr, lineNbr, lotSerialNbr: lot.lotSerialNbr, responseSnippet: responseXml.slice(0, 500) },
+        'Lot allocated — SOAP Submit returned',
       );
       return { success: true, message: `Lot ${lot.lotSerialNbr} allocated to ${orderType} ${orderNbr} line ${lineNbr}` };
     } catch (err) {
