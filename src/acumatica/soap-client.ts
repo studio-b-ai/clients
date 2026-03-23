@@ -180,7 +180,7 @@ export class SoapClient {
     this.username = config.username;
     this.password = config.password;
     this.tenant = config.tenant;
-    this.timeoutMs = opts.requestTimeoutMs ?? 30_000;
+    this.timeoutMs = opts.requestTimeoutMs ?? 60_000;
     this.log = opts.logger ?? pino({ name: 'acumatica-soap' });
   }
 
