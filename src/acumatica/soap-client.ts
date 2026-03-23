@@ -292,15 +292,15 @@ export class SoapClient {
       await this.login(screenID);
 
       const commands: SoapCommand[] = [
-        // Load the order
-        { fieldName: 'OrderType', objectName: 'Document', value: orderType, commit: true },
-        { fieldName: 'OrderNbr', objectName: 'Document', value: orderNbr, commit: true },
-        // Select the line
-        { fieldName: 'LineNbr', objectName: 'Transactions', value: lineNbr, commit: true },
-        // Set lot serial number — do NOT set Quantity here (causes lot discard)
-        { fieldName: 'LotSerialNbr', objectName: 'Transactions', value: lot.lotSerialNbr, commit: true },
-        // Save — no commit flag (it's an action, not a field value)
-        { fieldName: 'Save', objectName: 'Document' },
+        // Navigate to the order — Key type for navigation (NOT Value, which creates new records)
+        { fieldName: 'OrderType', objectName: 'Document', value: orderType, commit: true, type: 'Key' },
+        { fieldName: 'OrderNbr', objectName: 'Document', value: orderNbr, commit: true, type: 'Key' },
+        // Select the line — Key to navigate to specific line
+        { fieldName: 'LineNbr', objectName: 'Transactions', value: lineNbr, commit: true, type: 'Key' },
+        // Set lot serial number — Value type for writing. Do NOT set Quantity (causes lot discard)
+        { fieldName: 'LotSerialNbr', objectName: 'Transactions', value: lot.lotSerialNbr, commit: true, type: 'Value' },
+        // Save — Action type for screen actions
+        { fieldName: 'Save', objectName: 'Document', type: 'Action' },
       ];
 
       const responseXml = await this.submit(screenID, commands);
