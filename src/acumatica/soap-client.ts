@@ -118,11 +118,19 @@ function buildSubmitXml(commands: SoapCommand[]): string {
       //   Action = trigger screen action (Save, Delete, Cancel)
       //   Key    = navigate using key field
       const ACTION_FIELDS = new Set(['Save', 'Cancel', 'Delete', 'Insert', 'First', 'Last', 'Next', 'Prev']);
+      // When no explicit type, omit xsi:type entirely — Acumatica infers
+      // the command type from context (Value vs Action vs Key).
+      // Using explicit types causes issues: Field=read-only, Value=creates-new,
+      // Key=hangs. Omitting lets Acumatica handle it correctly.
       const xsiType = cmd.type
-        ?? (ACTION_FIELDS.has(cmd.fieldName) ? 'Action' : 'Value');
+        ?? (ACTION_FIELDS.has(cmd.fieldName) ? 'Action' : undefined);
 
       const parts: string[] = [];
-      parts.push(`      <Command xsi:type="${xsiType}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">`);
+      if (xsiType) {
+        parts.push(`      <Command xsi:type="${xsiType}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">`);
+      } else {
+        parts.push(`      <Command>`);
+      }
       parts.push(`        <FieldName>${escapeXml(cmd.fieldName)}</FieldName>`);
       parts.push(`        <ObjectName>${escapeXml(cmd.objectName)}</ObjectName>`);
       if (cmd.value !== undefined) {
@@ -292,15 +300,15 @@ export class SoapClient {
       await this.login(screenID);
 
       const commands: SoapCommand[] = [
-        // Navigate to the order — Key type for navigation (NOT Value, which creates new records)
-        { fieldName: 'OrderType', objectName: 'Document', value: orderType, commit: true, type: 'Key' },
-        { fieldName: 'OrderNbr', objectName: 'Document', value: orderNbr, commit: true, type: 'Key' },
-        // Select the line — Key to navigate to specific line
-        { fieldName: 'LineNbr', objectName: 'Transactions', value: lineNbr, commit: true, type: 'Key' },
-        // Set lot serial number — Value type for writing. Do NOT set Quantity (causes lot discard)
-        { fieldName: 'LotSerialNbr', objectName: 'Transactions', value: lot.lotSerialNbr, commit: true, type: 'Value' },
-        // Save — Action type for screen actions
-        { fieldName: 'Save', objectName: 'Document', type: 'Action' },
+        // Navigate to the order — no xsi:type, let Acumatica infer
+        { fieldName: 'OrderType', objectName: 'Document', value: orderType, commit: true },
+        { fieldName: 'OrderNbr', objectName: 'Document', value: orderNbr, commit: true },
+        // Select the line
+        { fieldName: 'LineNbr', objectName: 'Transactions', value: lineNbr, commit: true },
+        // Set lot serial number — do NOT set Quantity (causes lot discard)
+        { fieldName: 'LotSerialNbr', objectName: 'Transactions', value: lot.lotSerialNbr, commit: true },
+        // Save — Action type (auto-detected from ACTION_FIELDS set)
+        { fieldName: 'Save', objectName: 'Document' },
       ];
 
       const responseXml = await this.submit(screenID, commands);
