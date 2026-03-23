@@ -299,19 +299,24 @@ export class SoapClient {
     try {
       await this.login(screenID);
 
-      const commands: SoapCommand[] = [
-        // Navigate to the order — no xsi:type, let Acumatica infer
+      // Split into two Submit calls:
+      // 1. Navigate to the order (loads all caches: Document, Billing_Address, etc.)
+      // 2. Set lot + Save (writes to the loaded order)
+      // Single-submit fails because Save fires before navigation completes,
+      // causing Acumatica to INSERT new address records on a blank form.
+
+      // Step A: Navigate to the existing order
+      await this.submit(screenID, [
         { fieldName: 'OrderType', objectName: 'Document', value: orderType, commit: true },
         { fieldName: 'OrderNbr', objectName: 'Document', value: orderNbr, commit: true },
-        // Select the line
-        { fieldName: 'LineNbr', objectName: 'Transactions', value: lineNbr, commit: true },
-        // Set lot serial number — do NOT set Quantity (causes lot discard)
-        { fieldName: 'LotSerialNbr', objectName: 'Transactions', value: lot.lotSerialNbr, commit: true },
-        // Save — Action type (auto-detected from ACTION_FIELDS set)
-        { fieldName: 'Save', objectName: 'Document' },
-      ];
+      ]);
 
-      const responseXml = await this.submit(screenID, commands);
+      // Step B: Select line, set lot, save
+      const responseXml = await this.submit(screenID, [
+        { fieldName: 'LineNbr', objectName: 'Transactions', value: lineNbr, commit: true },
+        { fieldName: 'LotSerialNbr', objectName: 'Transactions', value: lot.lotSerialNbr, commit: true },
+        { fieldName: 'Save', objectName: 'Document' },
+      ]);
 
       // Log response snippet for debugging persistence issues
       this.log.info(
