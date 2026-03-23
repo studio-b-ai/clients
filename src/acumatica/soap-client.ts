@@ -382,3 +382,92 @@ export class SoapClient {
     }
   }
 }
+
+// ── Multi-Tenant Config ────────────────────────────────────────────────
+
+export interface TenantConfig {
+  baseUrl: string;
+  username: string;
+  password: string;
+  company: string;
+}
+
+export type TenantName = 'production' | 'test' | 'sandbox';
+
+export function loadTenantConfig(tenant: TenantName = 'production'): TenantConfig {
+  const url = process.env.ACUMATICA_URL ?? '';
+  const user = process.env.ACUMATICA_USERNAME ?? '';
+  const pass = process.env.ACUMATICA_PASSWORD ?? '';
+
+  const tenants: Record<TenantName, TenantConfig> = {
+    production: {
+      baseUrl: url,
+      username: user,
+      password: pass,
+      company: process.env.ACUMATICA_TENANT ?? 'Heritage Fabrics',
+    },
+    test: {
+      baseUrl: url,  // same instance
+      username: user,
+      password: pass,
+      company: 'Heritage Test',
+    },
+    sandbox: {
+      baseUrl: process.env.ACUMATICA_SANDBOX_URL ?? url,
+      username: process.env.ACUMATICA_SANDBOX_USERNAME ?? user,
+      password: process.env.ACUMATICA_SANDBOX_PASSWORD ?? pass,
+      company: process.env.ACUMATICA_SANDBOX_TENANT ?? 'Heritage Fabrics',
+    },
+  };
+
+  const config = tenants[tenant];
+  if (!config?.baseUrl) {
+    throw new Error(`No Acumatica config for tenant: ${tenant}`);
+  }
+  return config;
+}
+
+// ── Bolt Selection Logic ───────────────────────────────────────────────
+
+export interface AvailableLot {
+  lotSerialNbr: string;
+  qty: number;
+  receiptDate: string;
+}
+
+/**
+ * Select bolts for a piece goods order using Heritage Fabrics business rules:
+ *
+ * 1. Single-bolt preference: find bolts >= orderQty AND <= 120% of orderQty
+ * 2. Among qualifying bolts, pick the OLDEST (FIFO within range)
+ * 3. Multi-bolt fallback: accumulate bolts FIFO, skip any that would exceed 120%
+ */
+export function selectBolts(
+  available: AvailableLot[],
+  orderQty: number,
+  maxFillPercent = 1.2,
+): AvailableLot[] {
+  const maxQty = orderQty * maxFillPercent;
+
+  // Sort all lots by receipt date (oldest first = FIFO)
+  const sorted = [...available].sort(
+    (a, b) => new Date(a.receiptDate).getTime() - new Date(b.receiptDate).getTime(),
+  );
+
+  // Phase 1: Single bolt — >= orderQty AND <= 120%, oldest first
+  const singleBolt = sorted.find((l) => l.qty >= orderQty && l.qty <= maxQty);
+  if (singleBolt) return [singleBolt];
+
+  // Phase 2: Multi-bolt FIFO accumulation
+  const selected: AvailableLot[] = [];
+  let total = 0;
+
+  for (const lot of sorted) {
+    if (total >= orderQty) break;
+    if (total + lot.qty > maxQty) continue; // skip if would exceed 120%
+    selected.push(lot);
+    total += lot.qty;
+  }
+
+  return selected;
+}
