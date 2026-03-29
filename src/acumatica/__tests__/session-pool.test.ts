@@ -180,4 +180,39 @@ describe('SessionPool', () => {
       await pool.checkin(handle2);
     });
   });
+
+  describe('backpressure', () => {
+    it('should wait and retry when all slots checked out', async () => {
+      const pool = makePool({ maxSize: 1, pollIntervalMs: 50 });
+      const loginMock = vi.fn().mockResolvedValue('.ASPXAUTH=abc123');
+      pool._setLoginFn(loginMock);
+
+      // Checkout the only slot
+      const handle1 = await pool.checkout();
+      const slotId1 = handle1.slotId;
+
+      // Start second checkout (will block)
+      const checkoutPromise = pool.checkout();
+
+      // Checkin after 200ms — should unblock second checkout
+      setTimeout(() => pool.checkin(handle1), 200);
+
+      const handle2 = await checkoutPromise;
+      expect(handle2.slotId).toBe(slotId1);
+      expect(loginMock).toHaveBeenCalledOnce(); // Reused, no new login
+      await pool.checkin(handle2);
+    });
+
+    it('should throw SessionPoolExhaustedError on timeout', async () => {
+      const pool = makePool({ maxSize: 1, checkoutTimeoutMs: 300, pollIntervalMs: 50 });
+      const loginMock = vi.fn().mockResolvedValue('.ASPXAUTH=abc123');
+      pool._setLoginFn(loginMock);
+
+      // Checkout the only slot, don't checkin
+      await pool.checkout();
+
+      // Second checkout should timeout
+      await expect(pool.checkout()).rejects.toThrow('Session pool exhausted');
+    });
+  });
 });

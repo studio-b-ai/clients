@@ -312,6 +312,8 @@ export class SessionPool {
 
   /** Checkout a session slot. Returns a handle with cookie. */
   async checkout(): Promise<SessionHandle> {
+    const started = Date.now();
+
     // Circuit breaker check
     if (this.circuitBreaker.isOpen) {
       throw new Error(
@@ -385,8 +387,41 @@ export class SessionPool {
       };
     }
 
-    // At capacity — will be handled by backpressure in Task 5
-    throw new SessionPoolExhaustedError(this.account, 0);
+    // At capacity — enter polling loop (backpressure)
+    return this.waitForSlot(redis, started);
+  }
+
+  /** Poll for an available slot until one frees up or timeout */
+  private async waitForSlot(redis: Redis, started: number): Promise<SessionHandle> {
+    while (true) {
+      const elapsed = Date.now() - started;
+      if (elapsed > this.checkoutTimeoutMs) {
+        throw new SessionPoolExhaustedError(this.account, elapsed);
+      }
+
+      await new Promise((r) => setTimeout(r, this.pollIntervalMs));
+
+      const result = await redis.eval(
+        CHECKOUT_LUA,
+        1,
+        slotsKey(this.account),
+        this.account,
+        this.serviceId,
+        String(Date.now()),
+        String(this.staleCheckoutMs),
+      ) as [string | null, string?];
+
+      if (result[0]) {
+        this.log.debug({ slotId: result[0], waitMs: Date.now() - started }, 'Checked out slot after wait');
+        return {
+          slotId: result[0],
+          cookie: result[1] ?? '',
+          checkedOutBy: this.serviceId,
+          checkedOutAt: Date.now(),
+          degraded: false,
+        };
+      }
+    }
   }
 
   /** Return a session slot to the pool */
@@ -526,54 +561,68 @@ export class SessionPool {
     };
   }
 
-  /** Degraded checkout: login directly, track locally */
+  /** Degraded checkout: login directly, track locally, enforce capacity */
   private async degradedCheckout(): Promise<SessionHandle> {
-    const now = Date.now();
+    const started = Date.now();
 
-    // Try to reuse a local available slot, or reclaim stale
-    for (const [sid, slot] of this.localSlots) {
-      if (slot.checkedOutBy === '') {
-        slot.checkedOutBy = this.serviceId;
-        slot.checkedOutAt = now;
-        this.log.debug({ slotId: sid }, 'Reused local slot (degraded)');
+    while (true) {
+      const now = Date.now();
+
+      // Try to reuse a local available slot, or reclaim stale
+      for (const [sid, slot] of this.localSlots) {
+        if (slot.checkedOutBy === '') {
+          slot.checkedOutBy = this.serviceId;
+          slot.checkedOutAt = now;
+          this.log.debug({ slotId: sid }, 'Reused local slot (degraded)');
+          return {
+            slotId: sid,
+            cookie: slot.cookie,
+            checkedOutBy: this.serviceId,
+            checkedOutAt: now,
+            degraded: true,
+          };
+        }
+        // Check for stale checkout
+        if (slot.checkedOutAt > 0 && (now - slot.checkedOutAt) > this.staleCheckoutMs) {
+          slot.checkedOutBy = this.serviceId;
+          slot.checkedOutAt = now;
+          this.log.debug({ slotId: sid }, 'Reclaimed stale local slot (degraded)');
+          return {
+            slotId: sid,
+            cookie: slot.cookie,
+            checkedOutBy: this.serviceId,
+            checkedOutAt: now,
+            degraded: true,
+          };
+        }
+      }
+
+      // Under capacity — login and create new slot
+      if (this.localSlots.size < this.maxSize) {
+        const cookie = await this.loginToAcumatica();
+        const slotId = `degraded-${randomUUID().slice(0, 8)}`;
+        this.localSlots.set(slotId, {
+          cookie,
+          checkedOutBy: this.serviceId,
+          checkedOutAt: now,
+          createdAt: now,
+        });
         return {
-          slotId: sid,
-          cookie: slot.cookie,
+          slotId,
+          cookie,
           checkedOutBy: this.serviceId,
           checkedOutAt: now,
           degraded: true,
         };
       }
-      // Check for stale checkout
-      if (slot.checkedOutAt > 0 && (now - slot.checkedOutAt) > this.staleCheckoutMs) {
-        slot.checkedOutBy = this.serviceId;
-        slot.checkedOutAt = now;
-        this.log.debug({ slotId: sid }, 'Reclaimed stale local slot (degraded)');
-        return {
-          slotId: sid,
-          cookie: slot.cookie,
-          checkedOutBy: this.serviceId,
-          checkedOutAt: now,
-          degraded: true,
-        };
+
+      // At capacity — wait with backpressure
+      const elapsed = now - started;
+      if (elapsed > this.checkoutTimeoutMs) {
+        throw new SessionPoolExhaustedError(this.account, elapsed);
       }
+
+      await new Promise((r) => setTimeout(r, this.pollIntervalMs));
     }
-
-    // No available local slot — login
-    const cookie = await this.loginToAcumatica();
-    const slotId = `degraded-${randomUUID().slice(0, 8)}`;
-    this.localSlots.set(slotId, {
-      cookie,
-      checkedOutBy: this.serviceId,
-      checkedOutAt: now,
-      createdAt: now,
-    });
-    return {
-      slotId,
-      cookie,
-      checkedOutBy: this.serviceId,
-      checkedOutAt: now,
-      degraded: true,
-    };
   }
 }
