@@ -615,6 +615,42 @@ export class SessionPool {
 
   /** Get pool status */
   async status(): Promise<PoolStatus> {
+    const redis = this.getRedis();
+
+    // Redis mode: read from Redis
+    if (redis && !this.degraded) {
+      const now = Date.now();
+      let activeSlots = 0;
+      let checkedOut = 0;
+      const slots: PoolStatus['slots'] = [];
+
+      const slotIds = await redis.smembers(slotsKey(this.account));
+      for (const sid of slotIds) {
+        const slotData = await redis.hgetall(slotKey(this.account, sid));
+        if (!slotData || !slotData.createdAt) continue;
+        activeSlots++;
+        const isCheckedOut = slotData.checkedOutBy !== '';
+        if (isCheckedOut) checkedOut++;
+        slots.push({
+          id: sid,
+          ageMs: now - parseInt(slotData.createdAt, 10),
+          checkedOutBy: slotData.checkedOutBy,
+          idle: !isCheckedOut,
+        });
+      }
+
+      return {
+        account: this.account,
+        maxSize: this.maxSize,
+        activeSlots,
+        checkedOut,
+        available: activeSlots - checkedOut,
+        circuitBreaker: this.circuitBreaker.currentState,
+        degraded: false,
+        slots,
+      };
+    }
+
     // Degraded mode: report from local state
     let activeSlots = 0;
     let checkedOut = 0;
