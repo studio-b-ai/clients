@@ -53,6 +53,8 @@ export interface PoolConfig {
   checkoutTimeoutMs?: number;
   /** Polling interval when waiting for a slot (ms). Default: 2_000 */
   pollIntervalMs?: number;
+  /** Background keepalive interval for idle sessions (ms). Default: 600_000 (10 min) */
+  keepaliveMs?: number;
   /** Logger instance */
   logger?: Logger;
 }
@@ -197,6 +199,7 @@ export class SessionPool {
   readonly staleCheckoutMs: number;
   readonly checkoutTimeoutMs: number;
   readonly pollIntervalMs: number;
+  readonly keepaliveMs: number;
 
   private credentials: PoolConfig['credentials'];
   private redisUrl: string;
@@ -211,6 +214,10 @@ export class SessionPool {
 
   /** Test hook to replace the HTTP login call */
   private loginFn: (() => Promise<string>) | null = null;
+  /** Test hook to replace the keepalive ping */
+  private pingFn: ((cookie: string) => Promise<void>) | null = null;
+  /** Keepalive timer handle */
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: PoolConfig) {
     this.account = config.account;
@@ -221,6 +228,7 @@ export class SessionPool {
     this.staleCheckoutMs = config.staleCheckoutMs ?? 120_000;
     this.checkoutTimeoutMs = config.checkoutTimeoutMs ?? 30_000;
     this.pollIntervalMs = config.pollIntervalMs ?? 2_000;
+    this.keepaliveMs = config.keepaliveMs ?? 600_000;
     this.log = config.logger ?? pino({ name: `session-pool:${config.account}` });
     this.circuitBreaker = new AcumaticaCircuitBreaker();
   }
@@ -228,6 +236,81 @@ export class SessionPool {
   /** Test hook: replace HTTP login with a mock function */
   _setLoginFn(fn: () => Promise<string>): void {
     this.loginFn = fn;
+  }
+
+  /** Test hook: replace keepalive ping with a mock function */
+  _setPingFn(fn: (cookie: string) => Promise<void>): void {
+    this.pingFn = fn;
+  }
+
+  /** Start background keepalive that pings idle sessions to prevent TTL expiry */
+  startKeepalive(): void {
+    if (this.keepaliveTimer) return;
+    this.keepaliveTimer = setInterval(() => {
+      this.pingIdleSlots().catch((err) => {
+        this.log.warn({ err: (err as Error).message }, 'Keepalive ping cycle failed');
+      });
+    }, this.keepaliveMs);
+    this.keepaliveTimer.unref();
+    this.log.debug({ intervalMs: this.keepaliveMs }, 'Keepalive started');
+  }
+
+  /** Stop the keepalive timer */
+  stopKeepalive(): void {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+      this.log.debug('Keepalive stopped');
+    }
+  }
+
+  /** Ping all idle (not checked-out) slots. Evict any that return 401. */
+  private async pingIdleSlots(): Promise<void> {
+    // Degraded mode: iterate local slots
+    for (const [sid, slot] of this.localSlots) {
+      if (slot.checkedOutBy !== '') continue; // Skip checked-out slots
+      try {
+        await this.pingSession(slot.cookie);
+      } catch (err) {
+        if (this.is401Error(err)) {
+          this.log.debug({ slotId: sid }, 'Keepalive: idle slot expired, evicting');
+          await this.evictSlot(sid, true);
+        }
+      }
+    }
+
+    // Redis mode: iterate slot hashes
+    const redis = this.getRedis();
+    if (!redis || this.degraded) return;
+
+    const slotIds = await redis.smembers(slotsKey(this.account));
+    for (const sid of slotIds) {
+      const slotData = await redis.hgetall(slotKey(this.account, sid));
+      if (!slotData || slotData.checkedOutBy !== '') continue;
+      try {
+        await this.pingSession(slotData.cookie);
+      } catch (err) {
+        if (this.is401Error(err)) {
+          this.log.debug({ slotId: sid }, 'Keepalive: idle slot expired, evicting');
+          await this.evictSlot(sid, false);
+        }
+      }
+    }
+  }
+
+  /** Ping an Acumatica session to check if it's still valid */
+  private async pingSession(cookie: string): Promise<void> {
+    if (this.pingFn) return this.pingFn(cookie);
+
+    const baseUrl = this.credentials.baseUrl.replace(/\/$/, '');
+    const res = await undiciRequest(`${baseUrl}/entity/auth/login`, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    });
+    await res.body.text(); // Drain body
+    if (res.statusCode === 401) {
+      throw Object.assign(new Error('Session expired'), { statusCode: 401 });
+    }
   }
 
   /** Lazy-connect to Redis. Returns null if unreachable. */

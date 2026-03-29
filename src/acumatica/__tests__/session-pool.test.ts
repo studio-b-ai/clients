@@ -215,4 +215,70 @@ describe('SessionPool', () => {
       await expect(pool.checkout()).rejects.toThrow('Session pool exhausted');
     });
   });
+
+  describe('keepalive', () => {
+    it('should evict idle slots that return 401 on ping', async () => {
+      const pool = makePool({ keepaliveMs: 100 });
+      const loginMock = vi.fn().mockResolvedValue('.ASPXAUTH=abc123');
+      pool._setLoginFn(loginMock);
+
+      // Mock the keepalive ping to return 401 (session expired)
+      const pingMock = vi.fn().mockRejectedValue(Object.assign(new Error('Unauthorized'), { statusCode: 401 }));
+      pool._setPingFn(pingMock);
+
+      // Checkout and checkin — slot is now idle in pool
+      const handle = await pool.checkout();
+      await pool.checkin(handle);
+
+      let status = await pool.status();
+      expect(status.activeSlots).toBe(1);
+
+      // Start keepalive — should ping idle slot, get 401, evict
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 200));
+      pool.stopKeepalive();
+
+      status = await pool.status();
+      expect(status.activeSlots).toBe(0); // Evicted
+      expect(pingMock).toHaveBeenCalled();
+    });
+
+    it('should not evict idle slots that respond successfully', async () => {
+      const pool = makePool({ keepaliveMs: 100 });
+      const loginMock = vi.fn().mockResolvedValue('.ASPXAUTH=abc123');
+      pool._setLoginFn(loginMock);
+
+      // Mock ping success
+      const pingMock = vi.fn().mockResolvedValue(undefined);
+      pool._setPingFn(pingMock);
+
+      const handle = await pool.checkout();
+      await pool.checkin(handle);
+
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 200));
+      pool.stopKeepalive();
+
+      const status = await pool.status();
+      expect(status.activeSlots).toBe(1); // Still alive
+    });
+
+    it('should not ping checked-out slots', async () => {
+      const pool = makePool({ keepaliveMs: 100 });
+      const loginMock = vi.fn().mockResolvedValue('.ASPXAUTH=abc123');
+      pool._setLoginFn(loginMock);
+
+      const pingMock = vi.fn().mockResolvedValue(undefined);
+      pool._setPingFn(pingMock);
+
+      // Checkout but don't checkin — slot is busy
+      await pool.checkout();
+
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 200));
+      pool.stopKeepalive();
+
+      expect(pingMock).not.toHaveBeenCalled();
+    });
+  });
 });
