@@ -281,4 +281,63 @@ describe('SessionPool', () => {
       expect(pingMock).not.toHaveBeenCalled();
     });
   });
+
+  describe('onEvent', () => {
+    it('should emit pool_exhausted when checkout times out', async () => {
+      const events: Array<{ type: string; account: string }> = [];
+      const pool = makePool({
+        maxSize: 1,
+        checkoutTimeoutMs: 200,
+        pollIntervalMs: 50,
+        onEvent: (e) => events.push(e),
+      });
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=abc'));
+
+      await pool.checkout(); // Take the only slot
+      await pool.checkout().catch(() => {}); // Should timeout
+
+      expect(events).toHaveLength(1);
+      expect(events[0].type).toBe('pool_exhausted');
+      expect(events[0].account).toBe('api-bot');
+    });
+
+    it('should emit circuit_trip on AccountLockedError', async () => {
+      const events: Array<{ type: string }> = [];
+      const pool = makePool({ onEvent: (e) => events.push(e) });
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=abc'));
+
+      await pool.withSession(async () => {
+        throw new AccountLockedError('locked');
+      }).catch(() => {});
+
+      expect(events.some((e) => e.type === 'circuit_trip')).toBe(true);
+    });
+
+    it('should emit slot_evicted on 401', async () => {
+      const events: Array<{ type: string }> = [];
+      const pool = makePool({ onEvent: (e) => events.push(e) });
+      let call = 0;
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=abc'));
+
+      await pool.withSession(async () => {
+        call++;
+        if (call === 1) throw Object.assign(new Error('401'), { statusCode: 401 });
+        return 'ok';
+      });
+
+      expect(events.some((e) => e.type === 'slot_evicted')).toBe(true);
+    });
+
+    it('should emit stale_reclaimed when reclaiming stale slot', async () => {
+      const events: Array<{ type: string }> = [];
+      const pool = makePool({ staleCheckoutMs: 100, onEvent: (e) => events.push(e) });
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=abc'));
+
+      await pool.checkout(); // Don't checkin
+      await new Promise((r) => setTimeout(r, 150));
+      await pool.checkout(); // Should reclaim stale
+
+      expect(events.some((e) => e.type === 'stale_reclaimed')).toBe(true);
+    });
+  });
 });

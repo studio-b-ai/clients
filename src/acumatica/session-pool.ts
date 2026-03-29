@@ -31,6 +31,13 @@ export interface SessionHandle {
   degraded: boolean;
 }
 
+export interface PoolEvent {
+  type: 'pool_exhausted' | 'circuit_trip' | 'slot_evicted' | 'stale_reclaimed';
+  account: string;
+  detail: string;
+  timestamp: number;
+}
+
 export interface PoolConfig {
   /** Account name (e.g., "api-bot", "api-sync") */
   account: string;
@@ -55,6 +62,8 @@ export interface PoolConfig {
   pollIntervalMs?: number;
   /** Background keepalive interval for idle sessions (ms). Default: 600_000 (10 min) */
   keepaliveMs?: number;
+  /** Optional event callback for observability (Slack alerts, metrics) */
+  onEvent?: (event: PoolEvent) => void;
   /** Logger instance */
   logger?: Logger;
 }
@@ -218,6 +227,8 @@ export class SessionPool {
   private pingFn: ((cookie: string) => Promise<void>) | null = null;
   /** Keepalive timer handle */
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  /** Optional event callback */
+  private onEvent?: (event: PoolEvent) => void;
 
   constructor(config: PoolConfig) {
     this.account = config.account;
@@ -231,6 +242,12 @@ export class SessionPool {
     this.keepaliveMs = config.keepaliveMs ?? 600_000;
     this.log = config.logger ?? pino({ name: `session-pool:${config.account}` });
     this.circuitBreaker = new AcumaticaCircuitBreaker();
+    this.onEvent = config.onEvent;
+  }
+
+  /** Emit a pool event if callback is configured */
+  private emit(type: PoolEvent['type'], detail: string): void {
+    this.onEvent?.({ type, account: this.account, detail, timestamp: Date.now() });
   }
 
   /** Test hook: replace HTTP login with a mock function */
@@ -479,6 +496,7 @@ export class SessionPool {
     while (true) {
       const elapsed = Date.now() - started;
       if (elapsed > this.checkoutTimeoutMs) {
+        this.emit('pool_exhausted', `Timeout after ${elapsed}ms — all ${this.maxSize} slots checked out`);
         throw new SessionPoolExhaustedError(this.account, elapsed);
       }
 
@@ -546,6 +564,7 @@ export class SessionPool {
       if (err instanceof AccountLockedError) {
         await this.evictAllSlots();
         this.circuitBreaker.trip((err as Error).message);
+        this.emit('circuit_trip', (err as Error).message);
         throw err;
       }
 
@@ -574,6 +593,7 @@ export class SessionPool {
     if (isDegraded) {
       this.localSlots.delete(slotId);
       this.log.debug({ slotId }, 'Evicted local slot (degraded)');
+      this.emit('slot_evicted', `Evicted slot ${slotId} (degraded)`);
       return;
     }
 
@@ -591,6 +611,7 @@ export class SessionPool {
       slotId,
     );
     this.log.debug({ slotId }, 'Evicted pool slot');
+    this.emit('slot_evicted', `Evicted slot ${slotId}`);
   }
 
   /** Evict all slots from the pool (lockout scenario) */
@@ -706,6 +727,7 @@ export class SessionPool {
           slot.checkedOutBy = this.serviceId;
           slot.checkedOutAt = now;
           this.log.debug({ slotId: sid }, 'Reclaimed stale local slot (degraded)');
+          this.emit('stale_reclaimed', `Reclaimed stale slot ${sid}`);
           return {
             slotId: sid,
             cookie: slot.cookie,
@@ -738,6 +760,7 @@ export class SessionPool {
       // At capacity — wait with backpressure
       const elapsed = now - started;
       if (elapsed > this.checkoutTimeoutMs) {
+        this.emit('pool_exhausted', `Timeout after ${elapsed}ms — all ${this.maxSize} slots checked out (degraded)`);
         throw new SessionPoolExhaustedError(this.account, elapsed);
       }
 

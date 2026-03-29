@@ -23,7 +23,7 @@ export * as schemas from './schemas.js';
 export { SoapClient } from './soap-client.js';
 export type { SoapClientConfig, SoapCommand, AllocateLotParams, AllocateLotResult } from './soap-client.js';
 export { SessionPool, SessionPoolExhaustedError } from './session-pool.js';
-export type { PoolConfig, PoolStatus, SessionHandle } from './session-pool.js';
+export type { PoolConfig, PoolEvent, PoolStatus, SessionHandle } from './session-pool.js';
 
 // -- Factory --
 
