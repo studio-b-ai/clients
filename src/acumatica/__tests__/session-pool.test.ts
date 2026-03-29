@@ -148,4 +148,36 @@ describe('SessionPool', () => {
       await pool.checkin(handle2);
     });
   });
+
+  describe('status', () => {
+    it('should report pool state accurately', async () => {
+      const pool = makePool();
+      const loginMock = vi.fn()
+        .mockResolvedValueOnce('.ASPXAUTH=cookie1')
+        .mockResolvedValueOnce('.ASPXAUTH=cookie2');
+      pool._setLoginFn(loginMock);
+
+      // Checkout 2 slots
+      const handle1 = await pool.checkout();
+      const handle2 = await pool.checkout();
+
+      let status = await pool.status();
+      expect(status.activeSlots).toBe(2);
+      expect(status.checkedOut).toBe(2);
+      expect(status.available).toBe(0);
+      expect(status.account).toBe('api-bot');
+      expect(status.maxSize).toBe(3);
+      expect(status.degraded).toBe(true); // no Redis URL
+      expect(status.circuitBreaker).toBe('closed');
+
+      // Checkin 1
+      await pool.checkin(handle1);
+      status = await pool.status();
+      expect(status.checkedOut).toBe(1);
+      expect(status.available).toBe(1);
+      expect(status.activeSlots).toBe(2);
+
+      await pool.checkin(handle2);
+    });
+  });
 });
