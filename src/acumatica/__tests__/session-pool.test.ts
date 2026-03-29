@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SessionPool, type SessionHandle } from '../session-pool.js';
+import { AccountLockedError } from '../error-handler.js';
 
 function makePool(overrides: Partial<ConstructorParameters<typeof SessionPool>[0]> = {}) {
   return new SessionPool({
@@ -72,6 +73,79 @@ describe('SessionPool', () => {
       expect(handle.degraded).toBe(true);
       expect(handle.cookie).toBe('.ASPXAUTH=abc123');
       await pool.checkin(handle);
+    });
+  });
+
+  describe('withSession', () => {
+    it('should checkout, run fn, and checkin automatically', async () => {
+      const pool = makePool();
+      const loginMock = vi.fn().mockResolvedValue('.ASPXAUTH=abc123');
+      pool._setLoginFn(loginMock);
+
+      const result = await pool.withSession(async (handle) => {
+        expect(handle.cookie).toBe('.ASPXAUTH=abc123');
+        return 'ok';
+      });
+
+      expect(result).toBe('ok');
+      // After withSession, the slot should be available again
+      const status = await pool.status();
+      expect(status.checkedOut).toBe(0);
+    });
+
+    it('should evict slot on 401 and retry once', async () => {
+      const pool = makePool();
+      let callCount = 0;
+      const loginMock = vi.fn().mockResolvedValue('.ASPXAUTH=abc123');
+      pool._setLoginFn(loginMock);
+
+      const result = await pool.withSession(async (handle) => {
+        callCount++;
+        if (callCount === 1) {
+          const err = new Error('Unauthorized');
+          (err as any).statusCode = 401;
+          throw err;
+        }
+        return 'retried-ok';
+      });
+
+      expect(result).toBe('retried-ok');
+      expect(callCount).toBe(2);
+    });
+
+    it('should trip circuit breaker on AccountLockedError', async () => {
+      const pool = makePool();
+      const loginMock = vi.fn().mockResolvedValue('.ASPXAUTH=abc123');
+      pool._setLoginFn(loginMock);
+
+      await expect(
+        pool.withSession(async () => {
+          throw new AccountLockedError('Account locked');
+        }),
+      ).rejects.toThrow('Account locked');
+
+      expect(pool.circuitBreaker.currentState).toBe('open');
+    });
+  });
+
+  describe('stale reclamation', () => {
+    it('should reclaim slot after staleCheckoutMs', async () => {
+      const pool = makePool({ staleCheckoutMs: 100 });
+      const loginMock = vi.fn().mockResolvedValue('.ASPXAUTH=abc123');
+      pool._setLoginFn(loginMock);
+
+      // Checkout without checkin (simulate crash)
+      const handle1 = await pool.checkout();
+      const slotId1 = handle1.slotId;
+
+      // Wait for stale threshold
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Second checkout should reclaim the stale slot
+      const handle2 = await pool.checkout();
+      expect(handle2.slotId).toBe(slotId1);
+      expect(loginMock).toHaveBeenCalledOnce(); // No new login needed
+      await pool.checkin(handle2);
     });
   });
 });

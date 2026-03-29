@@ -413,19 +413,147 @@ export class SessionPool {
     this.log.debug({ slotId: handle.slotId }, 'Checked in slot');
   }
 
+  /**
+   * Execute fn while holding a session slot.
+   * Checkout → run fn → checkin (in finally).
+   * On 401: evict slot, retry once with fresh slot.
+   * On AccountLockedError: evict all, trip breaker, re-throw.
+   */
+  async withSession<T>(fn: (handle: SessionHandle) => Promise<T>): Promise<T> {
+    const handle = await this.checkout();
+    try {
+      return await fn(handle);
+    } catch (err) {
+      // AccountLockedError: evict all slots, trip circuit breaker
+      if (err instanceof AccountLockedError) {
+        await this.evictAllSlots();
+        this.circuitBreaker.trip((err as Error).message);
+        throw err;
+      }
+
+      // 401: evict this slot and retry once
+      if (this.is401Error(err)) {
+        this.log.warn({ slotId: handle.slotId }, 'Session expired (401), evicting and retrying');
+        await this.evictSlot(handle.slotId, handle.degraded);
+
+        // Retry once with a fresh slot
+        const retryHandle = await this.checkout();
+        try {
+          return await fn(retryHandle);
+        } finally {
+          await this.checkin(retryHandle);
+        }
+      }
+
+      throw err;
+    } finally {
+      await this.checkin(handle);
+    }
+  }
+
+  /** Evict a single slot from the pool */
+  private async evictSlot(slotId: string, isDegraded: boolean): Promise<void> {
+    if (isDegraded) {
+      this.localSlots.delete(slotId);
+      this.log.debug({ slotId }, 'Evicted local slot (degraded)');
+      return;
+    }
+
+    const redis = this.getRedis();
+    if (!redis || this.degraded) {
+      this.localSlots.delete(slotId);
+      return;
+    }
+
+    await redis.eval(
+      EVICT_SLOT_LUA,
+      2,
+      slotsKey(this.account),
+      slotKey(this.account, slotId),
+      slotId,
+    );
+    this.log.debug({ slotId }, 'Evicted pool slot');
+  }
+
+  /** Evict all slots from the pool (lockout scenario) */
+  private async evictAllSlots(): Promise<void> {
+    const redis = this.getRedis();
+    if (!redis || this.degraded) {
+      this.localSlots.clear();
+      return;
+    }
+
+    const slotIds = await redis.smembers(slotsKey(this.account));
+    for (const sid of slotIds) {
+      await this.evictSlot(sid, false);
+    }
+    this.log.warn({ account: this.account, evicted: slotIds.length }, 'Evicted all pool slots');
+  }
+
+  /** Check if error is a 401 Unauthorized */
+  private is401Error(err: unknown): boolean {
+    return (err as any)?.statusCode === 401;
+  }
+
+  /** Get pool status */
+  async status(): Promise<PoolStatus> {
+    // Degraded mode: report from local state
+    let activeSlots = 0;
+    let checkedOut = 0;
+    const slots: PoolStatus['slots'] = [];
+
+    for (const [sid, slot] of this.localSlots) {
+      activeSlots++;
+      const isCheckedOut = slot.checkedOutBy !== '';
+      if (isCheckedOut) checkedOut++;
+      slots.push({
+        id: sid,
+        ageMs: Date.now() - slot.createdAt,
+        checkedOutBy: slot.checkedOutBy,
+        idle: !isCheckedOut,
+      });
+    }
+
+    return {
+      account: this.account,
+      maxSize: this.maxSize,
+      activeSlots,
+      checkedOut,
+      available: activeSlots - checkedOut,
+      circuitBreaker: this.circuitBreaker.currentState,
+      degraded: this.degraded || !this.redisUrl,
+      slots,
+    };
+  }
+
   /** Degraded checkout: login directly, track locally */
   private async degradedCheckout(): Promise<SessionHandle> {
-    // Try to reuse a local available slot
+    const now = Date.now();
+
+    // Try to reuse a local available slot, or reclaim stale
     for (const [sid, slot] of this.localSlots) {
       if (slot.checkedOutBy === '') {
         slot.checkedOutBy = this.serviceId;
-        slot.checkedOutAt = Date.now();
+        slot.checkedOutAt = now;
         this.log.debug({ slotId: sid }, 'Reused local slot (degraded)');
         return {
           slotId: sid,
           cookie: slot.cookie,
           checkedOutBy: this.serviceId,
-          checkedOutAt: Date.now(),
+          checkedOutAt: now,
+          degraded: true,
+        };
+      }
+      // Check for stale checkout
+      if (slot.checkedOutAt > 0 && (now - slot.checkedOutAt) > this.staleCheckoutMs) {
+        slot.checkedOutBy = this.serviceId;
+        slot.checkedOutAt = now;
+        this.log.debug({ slotId: sid }, 'Reclaimed stale local slot (degraded)');
+        return {
+          slotId: sid,
+          cookie: slot.cookie,
+          checkedOutBy: this.serviceId,
+          checkedOutAt: now,
           degraded: true,
         };
       }
@@ -437,14 +565,14 @@ export class SessionPool {
     this.localSlots.set(slotId, {
       cookie,
       checkedOutBy: this.serviceId,
-      checkedOutAt: Date.now(),
-      createdAt: Date.now(),
+      checkedOutAt: now,
+      createdAt: now,
     });
     return {
       slotId,
       cookie,
       checkedOutBy: this.serviceId,
-      checkedOutAt: Date.now(),
+      checkedOutAt: now,
       degraded: true,
     };
   }
