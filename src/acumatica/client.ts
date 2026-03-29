@@ -113,7 +113,7 @@ const LOCKOUT_KEY = 'acumatica:lockout';
 const LOCKOUT_TTL_SECONDS = 600; // 10 minutes
 const LOGIN_FAILURES_KEY = 'acumatica:login-failures';
 const LOGIN_BUDGET_TTL_SECONDS = 1800; // 30-min sliding window
-const LOGIN_BUDGET_MAX = 1; // Trip guard after this many failures
+const LOGIN_BUDGET_MAX = 5; // was: 1 — single transient error shouldn't brick env
 
 export class AcumaticaClient {
   private baseUrl: string;
