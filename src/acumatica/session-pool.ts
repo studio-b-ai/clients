@@ -15,6 +15,7 @@
 
 import { randomUUID } from 'crypto';
 import { Redis } from 'ioredis';
+import { request as undiciRequest } from 'undici';
 import pino from 'pino';
 import type { Logger } from 'pino';
 import { AcumaticaCircuitBreaker } from './circuit-breaker.js';
@@ -205,6 +206,12 @@ export class SessionPool {
   private log: Logger;
   readonly circuitBreaker: AcumaticaCircuitBreaker;
 
+  /** In-memory slot store for degraded mode (no Redis) */
+  private localSlots = new Map<string, { cookie: string; checkedOutBy: string; checkedOutAt: number; createdAt: number }>();
+
+  /** Test hook to replace the HTTP login call */
+  private loginFn: (() => Promise<string>) | null = null;
+
   constructor(config: PoolConfig) {
     this.account = config.account;
     this.maxSize = config.maxSize;
@@ -216,5 +223,229 @@ export class SessionPool {
     this.pollIntervalMs = config.pollIntervalMs ?? 2_000;
     this.log = config.logger ?? pino({ name: `session-pool:${config.account}` });
     this.circuitBreaker = new AcumaticaCircuitBreaker();
+  }
+
+  /** Test hook: replace HTTP login with a mock function */
+  _setLoginFn(fn: () => Promise<string>): void {
+    this.loginFn = fn;
+  }
+
+  /** Lazy-connect to Redis. Returns null if unreachable. */
+  private getRedis(): Redis | null {
+    if (this.redis) return this.redis;
+    if (this.degraded) return null;
+    if (!this.redisUrl) {
+      this.degraded = true;
+      this.log.warn('Session pool degraded: no Redis URL configured');
+      return null;
+    }
+
+    try {
+      this.redis = new Redis(this.redisUrl, {
+        lazyConnect: false,
+        maxRetriesPerRequest: 1,
+        retryStrategy: (times: number) => {
+          if (times > 2) {
+            this.degraded = true;
+            this.log.warn('Session pool degraded: Redis connection failed');
+            return null;
+          }
+          return Math.min(times * 500, 2000);
+        },
+        enableOfflineQueue: false,
+      });
+
+      this.redis.on('error', (err: Error) => {
+        if (!this.degraded) {
+          this.degraded = true;
+          this.log.warn({ err: err.message }, 'Session pool degraded');
+        }
+      });
+
+      return this.redis;
+    } catch (err) {
+      this.degraded = true;
+      this.log.warn(
+        { err: (err as Error).message },
+        'Session pool degraded: init failed',
+      );
+      return null;
+    }
+  }
+
+  /** Login to Acumatica and return session cookie string */
+  private async loginToAcumatica(): Promise<string> {
+    if (this.loginFn) return this.loginFn();
+
+    const loginBody: Record<string, string> = {
+      name: this.credentials.username,
+      password: this.credentials.password,
+    };
+    if (this.credentials.tenant) loginBody.company = this.credentials.tenant;
+
+    const baseUrl = this.credentials.baseUrl.replace(/\/$/, '');
+    const res = await undiciRequest(`${baseUrl}/entity/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(loginBody),
+    });
+
+    const text = await res.body.text();
+
+    if (res.statusCode >= 400) {
+      if (res.statusCode === 500 && text.includes('locked out')) {
+        throw new AccountLockedError(
+          'Acumatica account locked out during pool login.',
+        );
+      }
+      throw new Error(`Pool login failed: HTTP ${res.statusCode} — ${text.slice(0, 200)}`);
+    }
+
+    const setCookieHeader = res.headers['set-cookie'];
+    const setCookies = Array.isArray(setCookieHeader)
+      ? setCookieHeader
+      : setCookieHeader
+        ? [setCookieHeader]
+        : [];
+    return setCookies.map((c) => c.split(';')[0]).join('; ');
+  }
+
+  /** Checkout a session slot. Returns a handle with cookie. */
+  async checkout(): Promise<SessionHandle> {
+    // Circuit breaker check
+    if (this.circuitBreaker.isOpen) {
+      throw new Error(
+        `Circuit breaker open for account "${this.account}": ${this.circuitBreaker.reason}`,
+      );
+    }
+
+    const redis = this.getRedis();
+
+    // Degraded mode: login directly, return handle
+    if (!redis || this.degraded) {
+      return this.degradedCheckout();
+    }
+
+    // Check lockout
+    const locked = await redis.get(lockoutKey(this.account)).catch(() => null);
+    if (locked) {
+      throw new AccountLockedError(
+        `Account "${this.account}" is locked out (Redis guard).`,
+      );
+    }
+
+    // Try CHECKOUT_LUA — find available or stale slot
+    const result = await redis.eval(
+      CHECKOUT_LUA,
+      1,
+      slotsKey(this.account),
+      this.account,
+      this.serviceId,
+      String(Date.now()),
+      String(this.staleCheckoutMs),
+    ) as [string | null, string?];
+
+    if (result[0]) {
+      this.log.debug({ slotId: result[0] }, 'Checked out existing slot');
+      return {
+        slotId: result[0],
+        cookie: result[1] ?? '',
+        checkedOutBy: this.serviceId,
+        checkedOutAt: Date.now(),
+        degraded: false,
+      };
+    }
+
+    // No available slot — check if under capacity
+    const activeCount = await redis.scard(slotsKey(this.account));
+    if (activeCount < this.maxSize) {
+      // Login and create a new slot
+      const cookie = await this.loginToAcumatica();
+      const newSlotId = `slot-${randomUUID().slice(0, 8)}`;
+      const now = String(Date.now());
+
+      await redis.eval(
+        CREATE_SLOT_LUA,
+        2,
+        slotsKey(this.account),
+        slotKey(this.account, newSlotId),
+        newSlotId,
+        cookie,
+        this.serviceId,
+        now,
+      );
+
+      this.log.debug({ slotId: newSlotId }, 'Created new pool slot');
+      return {
+        slotId: newSlotId,
+        cookie,
+        checkedOutBy: this.serviceId,
+        checkedOutAt: Date.now(),
+        degraded: false,
+      };
+    }
+
+    // At capacity — will be handled by backpressure in Task 5
+    throw new SessionPoolExhaustedError(this.account, 0);
+  }
+
+  /** Return a session slot to the pool */
+  async checkin(handle: SessionHandle): Promise<void> {
+    if (handle.degraded) {
+      this.localSlots.set(handle.slotId, {
+        cookie: handle.cookie,
+        checkedOutBy: '',
+        checkedOutAt: 0,
+        createdAt: Date.now(),
+      });
+      return;
+    }
+
+    const redis = this.getRedis();
+    if (!redis || this.degraded) return;
+
+    await redis.eval(
+      CHECKIN_LUA,
+      1,
+      slotKey(this.account, handle.slotId),
+      String(Date.now()),
+    );
+    this.log.debug({ slotId: handle.slotId }, 'Checked in slot');
+  }
+
+  /** Degraded checkout: login directly, track locally */
+  private async degradedCheckout(): Promise<SessionHandle> {
+    // Try to reuse a local available slot
+    for (const [sid, slot] of this.localSlots) {
+      if (slot.checkedOutBy === '') {
+        slot.checkedOutBy = this.serviceId;
+        slot.checkedOutAt = Date.now();
+        this.log.debug({ slotId: sid }, 'Reused local slot (degraded)');
+        return {
+          slotId: sid,
+          cookie: slot.cookie,
+          checkedOutBy: this.serviceId,
+          checkedOutAt: Date.now(),
+          degraded: true,
+        };
+      }
+    }
+
+    // No available local slot — login
+    const cookie = await this.loginToAcumatica();
+    const slotId = `degraded-${randomUUID().slice(0, 8)}`;
+    this.localSlots.set(slotId, {
+      cookie,
+      checkedOutBy: this.serviceId,
+      checkedOutAt: Date.now(),
+      createdAt: Date.now(),
+    });
+    return {
+      slotId,
+      cookie,
+      checkedOutBy: this.serviceId,
+      checkedOutAt: Date.now(),
+      degraded: true,
+    };
   }
 }
