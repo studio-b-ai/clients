@@ -34,6 +34,15 @@ export interface SoapClientConfig {
   logger?: Logger;
 }
 
+/**
+ * SOAP Screen API command types (from WSDL):
+ *   - Value:  SET a field value (write)
+ *   - Field:  READ a field value (return in response)
+ *   - Action: Trigger screen action (Save, Delete, Cancel)
+ *   - Key:    Navigate using key field
+ */
+export type SoapCommandType = 'Value' | 'Field' | 'Action' | 'Key';
+
 /** A single SOAP Screen API command (field set or action trigger). */
 export interface SoapCommand {
   /** Field name on the screen (e.g. "OrderType", "OrderNbr"). */
@@ -46,6 +55,8 @@ export interface SoapCommand {
   commit?: boolean;
   /** Linked command reference name (rarely needed). */
   linkedCommand?: string;
+  /** SOAP command type. Default: 'Value' for commands with value, 'Action' for Save/Delete/Cancel. */
+  type?: SoapCommandType;
 }
 
 /** Parameters for the allocateLot high-level method. */
@@ -101,8 +112,25 @@ function buildGetSchemaXml(): string {
 function buildSubmitXml(commands: SoapCommand[]): string {
   const commandsXml = commands
     .map((cmd) => {
+      // Determine xsi:type from WSDL types:
+      //   Value  = set a field value (write)
+      //   Field  = read a field value
+      //   Action = trigger screen action (Save, Delete, Cancel)
+      //   Key    = navigate using key field
+      const ACTION_FIELDS = new Set(['Save', 'Cancel', 'Delete', 'Insert', 'First', 'Last', 'Next', 'Prev']);
+      // When no explicit type, omit xsi:type entirely — Acumatica infers
+      // the command type from context (Value vs Action vs Key).
+      // Using explicit types causes issues: Field=read-only, Value=creates-new,
+      // Key=hangs. Omitting lets Acumatica handle it correctly.
+      const xsiType = cmd.type
+        ?? (ACTION_FIELDS.has(cmd.fieldName) ? 'Action' : undefined);
+
       const parts: string[] = [];
-      parts.push(`      <Command xsi:type="Field" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">`);
+      if (xsiType) {
+        parts.push(`      <Command xsi:type="${xsiType}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">`);
+      } else {
+        parts.push(`      <Command>`);
+      }
       parts.push(`        <FieldName>${escapeXml(cmd.fieldName)}</FieldName>`);
       parts.push(`        <ObjectName>${escapeXml(cmd.objectName)}</ObjectName>`);
       if (cmd.value !== undefined) {
@@ -160,7 +188,7 @@ export class SoapClient {
     this.username = config.username;
     this.password = config.password;
     this.tenant = config.tenant;
-    this.timeoutMs = opts.requestTimeoutMs ?? 30_000;
+    this.timeoutMs = opts.requestTimeoutMs ?? 60_000;
     this.log = opts.logger ?? pino({ name: 'acumatica-soap' });
   }
 
@@ -239,9 +267,13 @@ export class SoapClient {
    *   2. Load the order (OrderType + OrderNbr with commit)
    *   3. Select the line (LineNbr with commit)
    *   4. Set LotSerialNbr (with commit)
-   *   5. Optionally set Quantity
-   *   6. Save
-   *   7. Logout
+   *   5. Save (NO commit — action, not field value)
+   *   6. Logout
+   *
+   *   IMPORTANT: Do NOT set Quantity alongside LotSerialNbr — causes
+   *   Acumatica to re-evaluate splits and discard the lot assignment.
+   *   Same pattern as REST API: "Do NOT include OrderQty in same PUT
+   *   as Allocations."
    *
    * Currently supports single-lot only.
    * TODO: Multi-lot requires accessing the Allocations split view.
@@ -267,38 +299,29 @@ export class SoapClient {
     try {
       await this.login(screenID);
 
-      const commands: SoapCommand[] = [
-        // Load the order
+      // Split into two Submit calls:
+      // 1. Navigate to the order (loads all caches: Document, Billing_Address, etc.)
+      // 2. Set lot + Save (writes to the loaded order)
+      // Single-submit fails because Save fires before navigation completes,
+      // causing Acumatica to INSERT new address records on a blank form.
+
+      // Step A: Navigate to the existing order
+      await this.submit(screenID, [
         { fieldName: 'OrderType', objectName: 'Document', value: orderType, commit: true },
         { fieldName: 'OrderNbr', objectName: 'Document', value: orderNbr, commit: true },
-        // Select the line
+      ]);
+
+      // Step B: Select line, set lot, save
+      const responseXml = await this.submit(screenID, [
         { fieldName: 'LineNbr', objectName: 'Transactions', value: lineNbr, commit: true },
-        // Set lot serial number
         { fieldName: 'LotSerialNbr', objectName: 'Transactions', value: lot.lotSerialNbr, commit: true },
-      ];
+        { fieldName: 'Save', objectName: 'Document' },
+      ]);
 
-      // If quantity specified, set it too
-      if (lot.quantity !== undefined) {
-        commands.push({
-          fieldName: 'Quantity',
-          objectName: 'Transactions',
-          value: String(lot.quantity),
-          commit: true,
-        });
-      }
-
-      // Save the order
-      commands.push({
-        fieldName: 'Save',
-        objectName: 'Document',
-        commit: true,
-      });
-
-      await this.submit(screenID, commands);
-
+      // Log response snippet for debugging persistence issues
       this.log.info(
-        { orderType, orderNbr, lineNbr, lotSerialNbr: lot.lotSerialNbr },
-        'Lot allocated successfully',
+        { orderType, orderNbr, lineNbr, lotSerialNbr: lot.lotSerialNbr, responseSnippet: responseXml.slice(0, 500) },
+        'Lot allocated — SOAP Submit returned',
       );
       return { success: true, message: `Lot ${lot.lotSerialNbr} allocated to ${orderType} ${orderNbr} line ${lineNbr}` };
     } catch (err) {
@@ -381,4 +404,93 @@ export class SoapClient {
       throw new Error(`SOAP ${operation} fault: ${faultMsg}`);
     }
   }
+}
+
+// ── Multi-Tenant Config ────────────────────────────────────────────────
+
+export interface TenantConfig {
+  baseUrl: string;
+  username: string;
+  password: string;
+  company: string;
+}
+
+export type TenantName = 'production' | 'test' | 'sandbox';
+
+export function loadTenantConfig(tenant: TenantName = 'production'): TenantConfig {
+  const url = process.env.ACUMATICA_URL ?? '';
+  const user = process.env.ACUMATICA_USERNAME ?? '';
+  const pass = process.env.ACUMATICA_PASSWORD ?? '';
+
+  const tenants: Record<TenantName, TenantConfig> = {
+    production: {
+      baseUrl: url,
+      username: user,
+      password: pass,
+      company: process.env.ACUMATICA_TENANT ?? 'Heritage Fabrics',
+    },
+    test: {
+      baseUrl: url,  // same instance
+      username: user,
+      password: pass,
+      company: 'Heritage Test',
+    },
+    sandbox: {
+      baseUrl: process.env.ACUMATICA_SANDBOX_URL ?? url,
+      username: process.env.ACUMATICA_SANDBOX_USERNAME ?? user,
+      password: process.env.ACUMATICA_SANDBOX_PASSWORD ?? pass,
+      company: process.env.ACUMATICA_SANDBOX_TENANT ?? 'Heritage Fabrics',
+    },
+  };
+
+  const config = tenants[tenant];
+  if (!config?.baseUrl) {
+    throw new Error(`No Acumatica config for tenant: ${tenant}`);
+  }
+  return config;
+}
+
+// ── Bolt Selection Logic ───────────────────────────────────────────────
+
+export interface AvailableLot {
+  lotSerialNbr: string;
+  qty: number;
+  receiptDate: string;
+}
+
+/**
+ * Select bolts for a piece goods order using Heritage Fabrics business rules:
+ *
+ * 1. Single-bolt preference: find bolts >= orderQty AND <= 120% of orderQty
+ * 2. Among qualifying bolts, pick the OLDEST (FIFO within range)
+ * 3. Multi-bolt fallback: accumulate bolts FIFO, skip any that would exceed 120%
+ */
+export function selectBolts(
+  available: AvailableLot[],
+  orderQty: number,
+  maxFillPercent = 1.2,
+): AvailableLot[] {
+  const maxQty = orderQty * maxFillPercent;
+
+  // Sort all lots by receipt date (oldest first = FIFO)
+  const sorted = [...available].sort(
+    (a, b) => new Date(a.receiptDate).getTime() - new Date(b.receiptDate).getTime(),
+  );
+
+  // Phase 1: Single bolt — >= orderQty AND <= 120%, oldest first
+  const singleBolt = sorted.find((l) => l.qty >= orderQty && l.qty <= maxQty);
+  if (singleBolt) return [singleBolt];
+
+  // Phase 2: Multi-bolt FIFO accumulation
+  const selected: AvailableLot[] = [];
+  let total = 0;
+
+  for (const lot of sorted) {
+    if (total >= orderQty) break;
+    if (total + lot.qty > maxQty) continue; // skip if would exceed 120%
+    selected.push(lot);
+    total += lot.qty;
+  }
+
+  return selected;
 }
