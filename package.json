@@ -28,7 +28,9 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest run",
+    "test": "vitest run --exclude '**/**.integration.test.ts'",
+    "test:integration": "vitest run src/acumatica/__tests__/session-pool.integration.test.ts",
+    "test:all": "vitest run",
     "clean": "rm -rf dist"
   },
   "dependencies": {

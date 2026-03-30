@@ -1,0 +1,770 @@
+/**
+ * Per-account Acumatica session pool with Redis-backed cookie reuse.
+ *
+ * Replaces the pattern of login→work→logout on every request with
+ * checkout→work→checkin, reusing session cookies across requests.
+ * Each account gets its own pool with configurable max slots.
+ *
+ * Redis data model:
+ *   acumatica:pool:{account}:meta    — hash (maxSize, activeLogins)
+ *   acumatica:pool:{account}:slots   — set of active slot IDs
+ *   acumatica:pool:{account}:slot:{id} — hash (cookie, timestamps, checkout state)
+ *   acumatica:lockout:{account}      — string with TTL (circuit breaker lockout)
+ *   acumatica:pool:{account}:login-failures — string with TTL (failure counter)
+ */
+
+import { randomUUID } from 'crypto';
+import { Redis } from 'ioredis';
+import { request as undiciRequest } from 'undici';
+import pino from 'pino';
+import type { Logger } from 'pino';
+import { AcumaticaCircuitBreaker } from './circuit-breaker.js';
+import { AccountLockedError } from './error-handler.js';
+
+// -- Types --
+
+export interface SessionHandle {
+  slotId: string;
+  cookie: string;
+  checkedOutBy: string;
+  checkedOutAt: number;
+  degraded: boolean;
+}
+
+export interface PoolEvent {
+  type: 'pool_exhausted' | 'circuit_trip' | 'slot_evicted' | 'stale_reclaimed';
+  account: string;
+  detail: string;
+  timestamp: number;
+}
+
+export interface PoolConfig {
+  /** Account name (e.g., "api-bot", "api-sync") */
+  account: string;
+  /** Max concurrent pooled sessions */
+  maxSize: number;
+  /** Acumatica credentials */
+  credentials: {
+    baseUrl: string;
+    username: string;
+    password: string;
+    tenant?: string;
+  };
+  /** Redis URL for coordination. Empty string = degraded mode. */
+  redisUrl: string;
+  /** Service identifier for checkout tracking */
+  serviceId: string;
+  /** How long before a checked-out slot is considered stale (ms). Default: 120_000 */
+  staleCheckoutMs?: number;
+  /** Max time to wait for a slot (ms). Default: 30_000 */
+  checkoutTimeoutMs?: number;
+  /** Polling interval when waiting for a slot (ms). Default: 2_000 */
+  pollIntervalMs?: number;
+  /** Background keepalive interval for idle sessions (ms). Default: 600_000 (10 min) */
+  keepaliveMs?: number;
+  /** Optional event callback for observability (Slack alerts, metrics) */
+  onEvent?: (event: PoolEvent) => void;
+  /** Logger instance */
+  logger?: Logger;
+}
+
+export interface PoolStatus {
+  account: string;
+  maxSize: number;
+  activeSlots: number;
+  checkedOut: number;
+  available: number;
+  circuitBreaker: string;
+  degraded: boolean;
+  slots: Array<{
+    id: string;
+    ageMs: number;
+    checkedOutBy: string;
+    idle: boolean;
+  }>;
+}
+
+export class SessionPoolExhaustedError extends Error {
+  account: string;
+  waitMs: number;
+
+  constructor(account: string, waitMs: number) {
+    super(
+      `Session pool exhausted for account "${account}" after ${waitMs}ms — all slots checked out`,
+    );
+    this.name = 'SessionPoolExhaustedError';
+    this.account = account;
+    this.waitMs = waitMs;
+  }
+}
+
+// -- Redis key helpers --
+
+function metaKey(account: string): string {
+  return `acumatica:pool:${account}:meta`;
+}
+
+function slotsKey(account: string): string {
+  return `acumatica:pool:${account}:slots`;
+}
+
+function slotKey(account: string, slotId: string): string {
+  return `acumatica:pool:${account}:slot:${slotId}`;
+}
+
+function lockoutKey(account: string): string {
+  return `acumatica:lockout:${account}`;
+}
+
+function loginFailuresKey(account: string): string {
+  return `acumatica:pool:${account}:login-failures`;
+}
+
+// -- Lua scripts --
+
+/**
+ * CHECKOUT_LUA: Find an available slot (checkedOutBy == "") or reclaim a stale one.
+ * KEYS[1] = slotsKey, ARGV[1] = account, ARGV[2] = serviceId, ARGV[3] = now, ARGV[4] = staleMs
+ * Returns: [slotId, cookie] or [nil] if none available.
+ */
+const CHECKOUT_LUA = `
+  local slotsKey = KEYS[1]
+  local account = ARGV[1]
+  local serviceId = ARGV[2]
+  local now = tonumber(ARGV[3])
+  local staleMs = tonumber(ARGV[4])
+
+  local slotIds = redis.call('SMEMBERS', slotsKey)
+  for _, sid in ipairs(slotIds) do
+    local sk = 'acumatica:pool:' .. account .. ':slot:' .. sid
+    local checkedOutBy = redis.call('HGET', sk, 'checkedOutBy')
+    if checkedOutBy == '' or checkedOutBy == false then
+      -- Available slot: check it out
+      redis.call('HSET', sk, 'checkedOutBy', serviceId, 'checkedOutAt', tostring(now))
+      local cookie = redis.call('HGET', sk, 'cookie')
+      return {sid, cookie or ''}
+    else
+      -- Check for stale checkout
+      local checkedOutAt = tonumber(redis.call('HGET', sk, 'checkedOutAt') or '0')
+      if checkedOutAt > 0 and (now - checkedOutAt) > staleMs then
+        -- Reclaim stale slot
+        redis.call('HSET', sk, 'checkedOutBy', serviceId, 'checkedOutAt', tostring(now))
+        local cookie = redis.call('HGET', sk, 'cookie')
+        return {sid, cookie or ''}
+      end
+    end
+  end
+  return {nil}
+`;
+
+/**
+ * CHECKIN_LUA: Return a slot to the pool.
+ * KEYS[1] = slotKey, ARGV[1] = now
+ */
+const CHECKIN_LUA = `
+  local sk = KEYS[1]
+  redis.call('HSET', sk, 'checkedOutBy', '', 'checkedOutAt', '0', 'lastUsedAt', ARGV[1])
+  return 1
+`;
+
+/**
+ * CREATE_SLOT_LUA: Create a new slot and add to the index.
+ * KEYS[1] = slotsKey, KEYS[2] = slotKey
+ * ARGV[1] = slotId, ARGV[2] = cookie, ARGV[3] = serviceId, ARGV[4] = now
+ */
+const CREATE_SLOT_LUA = `
+  local slotsKey = KEYS[1]
+  local sk = KEYS[2]
+  local slotId = ARGV[1]
+  local cookie = ARGV[2]
+  local serviceId = ARGV[3]
+  local now = ARGV[4]
+
+  redis.call('SADD', slotsKey, slotId)
+  redis.call('HSET', sk,
+    'cookie', cookie,
+    'createdAt', now,
+    'lastUsedAt', now,
+    'checkedOutBy', serviceId,
+    'checkedOutAt', now)
+  return 1
+`;
+
+/**
+ * EVICT_SLOT_LUA: Remove a slot from the pool.
+ * KEYS[1] = slotsKey, KEYS[2] = slotKey, ARGV[1] = slotId
+ */
+const EVICT_SLOT_LUA = `
+  redis.call('SREM', KEYS[1], ARGV[1])
+  redis.call('DEL', KEYS[2])
+  return 1
+`;
+
+// -- SessionPool --
+
+export class SessionPool {
+  readonly account: string;
+  readonly maxSize: number;
+  readonly staleCheckoutMs: number;
+  readonly checkoutTimeoutMs: number;
+  readonly pollIntervalMs: number;
+  readonly keepaliveMs: number;
+
+  private credentials: PoolConfig['credentials'];
+  private redisUrl: string;
+  private serviceId: string;
+  private redis: Redis | null = null;
+  private degraded = false;
+  private log: Logger;
+  readonly circuitBreaker: AcumaticaCircuitBreaker;
+
+  /** In-memory slot store for degraded mode (no Redis) */
+  private localSlots = new Map<string, { cookie: string; checkedOutBy: string; checkedOutAt: number; createdAt: number }>();
+
+  /** Test hook to replace the HTTP login call */
+  private loginFn: (() => Promise<string>) | null = null;
+  /** Test hook to replace the keepalive ping */
+  private pingFn: ((cookie: string) => Promise<void>) | null = null;
+  /** Keepalive timer handle */
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  /** Optional event callback */
+  private onEvent?: (event: PoolEvent) => void;
+
+  constructor(config: PoolConfig) {
+    this.account = config.account;
+    this.maxSize = config.maxSize;
+    this.credentials = config.credentials;
+    this.redisUrl = config.redisUrl;
+    this.serviceId = config.serviceId;
+    this.staleCheckoutMs = config.staleCheckoutMs ?? 120_000;
+    this.checkoutTimeoutMs = config.checkoutTimeoutMs ?? 30_000;
+    this.pollIntervalMs = config.pollIntervalMs ?? 2_000;
+    this.keepaliveMs = config.keepaliveMs ?? 600_000;
+    this.log = config.logger ?? pino({ name: `session-pool:${config.account}` });
+    this.circuitBreaker = new AcumaticaCircuitBreaker();
+    this.onEvent = config.onEvent;
+  }
+
+  /** Emit a pool event if callback is configured */
+  private emit(type: PoolEvent['type'], detail: string): void {
+    this.onEvent?.({ type, account: this.account, detail, timestamp: Date.now() });
+  }
+
+  /** Test hook: replace HTTP login with a mock function */
+  _setLoginFn(fn: () => Promise<string>): void {
+    this.loginFn = fn;
+  }
+
+  /** Test hook: replace keepalive ping with a mock function */
+  _setPingFn(fn: (cookie: string) => Promise<void>): void {
+    this.pingFn = fn;
+  }
+
+  /** Start background keepalive that pings idle sessions to prevent TTL expiry */
+  startKeepalive(): void {
+    if (this.keepaliveTimer) return;
+    this.keepaliveTimer = setInterval(() => {
+      this.pingIdleSlots().catch((err) => {
+        this.log.warn({ err: (err as Error).message }, 'Keepalive ping cycle failed');
+      });
+    }, this.keepaliveMs);
+    this.keepaliveTimer.unref();
+    this.log.debug({ intervalMs: this.keepaliveMs }, 'Keepalive started');
+  }
+
+  /** Stop the keepalive timer */
+  stopKeepalive(): void {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+      this.log.debug('Keepalive stopped');
+    }
+  }
+
+  /** Ping all idle (not checked-out) slots. Evict any that return 401. */
+  private async pingIdleSlots(): Promise<void> {
+    // Degraded mode: iterate local slots
+    for (const [sid, slot] of this.localSlots) {
+      if (slot.checkedOutBy !== '') continue; // Skip checked-out slots
+      try {
+        await this.pingSession(slot.cookie);
+      } catch (err) {
+        if (this.is401Error(err)) {
+          this.log.debug({ slotId: sid }, 'Keepalive: idle slot expired, evicting');
+          await this.evictSlot(sid, true);
+        }
+      }
+    }
+
+    // Redis mode: iterate slot hashes
+    const redis = this.getRedis();
+    if (!redis || this.degraded) return;
+
+    const slotIds = await redis.smembers(slotsKey(this.account));
+    for (const sid of slotIds) {
+      const slotData = await redis.hgetall(slotKey(this.account, sid));
+      if (!slotData || slotData.checkedOutBy !== '') continue;
+      try {
+        await this.pingSession(slotData.cookie);
+      } catch (err) {
+        if (this.is401Error(err)) {
+          this.log.debug({ slotId: sid }, 'Keepalive: idle slot expired, evicting');
+          await this.evictSlot(sid, false);
+        }
+      }
+    }
+  }
+
+  /** Ping an Acumatica session to check if it's still valid */
+  private async pingSession(cookie: string): Promise<void> {
+    if (this.pingFn) return this.pingFn(cookie);
+
+    const baseUrl = this.credentials.baseUrl.replace(/\/$/, '');
+    const res = await undiciRequest(`${baseUrl}/entity/auth/login`, {
+      method: 'GET',
+      headers: { Cookie: cookie },
+    });
+    await res.body.text(); // Drain body
+    if (res.statusCode === 401) {
+      throw Object.assign(new Error('Session expired'), { statusCode: 401 });
+    }
+  }
+
+  /** Lazy-connect to Redis. Returns null if unreachable. */
+  private getRedis(): Redis | null {
+    if (this.redis) return this.redis;
+    if (this.degraded) return null;
+    if (!this.redisUrl) {
+      this.degraded = true;
+      this.log.warn('Session pool degraded: no Redis URL configured');
+      return null;
+    }
+
+    try {
+      this.redis = new Redis(this.redisUrl, {
+        lazyConnect: false,
+        maxRetriesPerRequest: 1,
+        retryStrategy: (times: number) => {
+          if (times > 2) {
+            this.degraded = true;
+            this.log.warn('Session pool degraded: Redis connection failed');
+            return null;
+          }
+          return Math.min(times * 500, 2000);
+        },
+        enableOfflineQueue: false,
+      });
+
+      this.redis.on('error', (err: Error) => {
+        if (!this.degraded) {
+          this.degraded = true;
+          this.log.warn({ err: err.message }, 'Session pool degraded');
+        }
+      });
+
+      return this.redis;
+    } catch (err) {
+      this.degraded = true;
+      this.log.warn(
+        { err: (err as Error).message },
+        'Session pool degraded: init failed',
+      );
+      return null;
+    }
+  }
+
+  /** Login to Acumatica and return session cookie string */
+  private async loginToAcumatica(): Promise<string> {
+    if (this.loginFn) return this.loginFn();
+
+    const loginBody: Record<string, string> = {
+      name: this.credentials.username,
+      password: this.credentials.password,
+    };
+    if (this.credentials.tenant) loginBody.company = this.credentials.tenant;
+
+    const baseUrl = this.credentials.baseUrl.replace(/\/$/, '');
+    const res = await undiciRequest(`${baseUrl}/entity/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(loginBody),
+    });
+
+    const text = await res.body.text();
+
+    if (res.statusCode >= 400) {
+      if (res.statusCode === 500 && text.includes('locked out')) {
+        throw new AccountLockedError(
+          'Acumatica account locked out during pool login.',
+        );
+      }
+      throw new Error(`Pool login failed: HTTP ${res.statusCode} — ${text.slice(0, 200)}`);
+    }
+
+    const setCookieHeader = res.headers['set-cookie'];
+    const setCookies = Array.isArray(setCookieHeader)
+      ? setCookieHeader
+      : setCookieHeader
+        ? [setCookieHeader]
+        : [];
+    return setCookies.map((c) => c.split(';')[0]).join('; ');
+  }
+
+  /** Checkout a session slot. Returns a handle with cookie. */
+  async checkout(): Promise<SessionHandle> {
+    const started = Date.now();
+
+    // Circuit breaker check
+    if (this.circuitBreaker.isOpen) {
+      throw new Error(
+        `Circuit breaker open for account "${this.account}": ${this.circuitBreaker.reason}`,
+      );
+    }
+
+    const redis = this.getRedis();
+
+    // Degraded mode: login directly, return handle
+    if (!redis || this.degraded) {
+      return this.degradedCheckout();
+    }
+
+    // Check lockout
+    const locked = await redis.get(lockoutKey(this.account)).catch(() => null);
+    if (locked) {
+      throw new AccountLockedError(
+        `Account "${this.account}" is locked out (Redis guard).`,
+      );
+    }
+
+    // Try CHECKOUT_LUA — find available or stale slot
+    const result = await redis.eval(
+      CHECKOUT_LUA,
+      1,
+      slotsKey(this.account),
+      this.account,
+      this.serviceId,
+      String(Date.now()),
+      String(this.staleCheckoutMs),
+    ) as [string | null, string?];
+
+    if (result[0]) {
+      this.log.debug({ slotId: result[0] }, 'Checked out existing slot');
+      return {
+        slotId: result[0],
+        cookie: result[1] ?? '',
+        checkedOutBy: this.serviceId,
+        checkedOutAt: Date.now(),
+        degraded: false,
+      };
+    }
+
+    // No available slot — check if under capacity
+    const activeCount = await redis.scard(slotsKey(this.account));
+    if (activeCount < this.maxSize) {
+      // Login and create a new slot
+      const cookie = await this.loginToAcumatica();
+      const newSlotId = `slot-${randomUUID().slice(0, 8)}`;
+      const now = String(Date.now());
+
+      await redis.eval(
+        CREATE_SLOT_LUA,
+        2,
+        slotsKey(this.account),
+        slotKey(this.account, newSlotId),
+        newSlotId,
+        cookie,
+        this.serviceId,
+        now,
+      );
+
+      this.log.debug({ slotId: newSlotId }, 'Created new pool slot');
+      return {
+        slotId: newSlotId,
+        cookie,
+        checkedOutBy: this.serviceId,
+        checkedOutAt: Date.now(),
+        degraded: false,
+      };
+    }
+
+    // At capacity — enter polling loop (backpressure)
+    return this.waitForSlot(redis, started);
+  }
+
+  /** Poll for an available slot until one frees up or timeout */
+  private async waitForSlot(redis: Redis, started: number): Promise<SessionHandle> {
+    while (true) {
+      const elapsed = Date.now() - started;
+      if (elapsed > this.checkoutTimeoutMs) {
+        this.emit('pool_exhausted', `Timeout after ${elapsed}ms — all ${this.maxSize} slots checked out`);
+        throw new SessionPoolExhaustedError(this.account, elapsed);
+      }
+
+      await new Promise((r) => setTimeout(r, this.pollIntervalMs));
+
+      const result = await redis.eval(
+        CHECKOUT_LUA,
+        1,
+        slotsKey(this.account),
+        this.account,
+        this.serviceId,
+        String(Date.now()),
+        String(this.staleCheckoutMs),
+      ) as [string | null, string?];
+
+      if (result[0]) {
+        this.log.debug({ slotId: result[0], waitMs: Date.now() - started }, 'Checked out slot after wait');
+        return {
+          slotId: result[0],
+          cookie: result[1] ?? '',
+          checkedOutBy: this.serviceId,
+          checkedOutAt: Date.now(),
+          degraded: false,
+        };
+      }
+    }
+  }
+
+  /** Return a session slot to the pool */
+  async checkin(handle: SessionHandle): Promise<void> {
+    if (handle.degraded) {
+      this.localSlots.set(handle.slotId, {
+        cookie: handle.cookie,
+        checkedOutBy: '',
+        checkedOutAt: 0,
+        createdAt: Date.now(),
+      });
+      return;
+    }
+
+    const redis = this.getRedis();
+    if (!redis || this.degraded) return;
+
+    await redis.eval(
+      CHECKIN_LUA,
+      1,
+      slotKey(this.account, handle.slotId),
+      String(Date.now()),
+    );
+    this.log.debug({ slotId: handle.slotId }, 'Checked in slot');
+  }
+
+  /**
+   * Execute fn while holding a session slot.
+   * Checkout → run fn → checkin (in finally).
+   * On 401: evict slot, retry once with fresh slot.
+   * On AccountLockedError: evict all, trip breaker, re-throw.
+   */
+  async withSession<T>(fn: (handle: SessionHandle) => Promise<T>): Promise<T> {
+    const handle = await this.checkout();
+    try {
+      return await fn(handle);
+    } catch (err) {
+      // AccountLockedError: evict all slots, trip circuit breaker
+      if (err instanceof AccountLockedError) {
+        await this.evictAllSlots();
+        this.circuitBreaker.trip((err as Error).message);
+        this.emit('circuit_trip', (err as Error).message);
+        throw err;
+      }
+
+      // 401: evict this slot and retry once
+      if (this.is401Error(err)) {
+        this.log.warn({ slotId: handle.slotId }, 'Session expired (401), evicting and retrying');
+        await this.evictSlot(handle.slotId, handle.degraded);
+
+        // Retry once with a fresh slot
+        const retryHandle = await this.checkout();
+        try {
+          return await fn(retryHandle);
+        } finally {
+          await this.checkin(retryHandle);
+        }
+      }
+
+      throw err;
+    } finally {
+      await this.checkin(handle);
+    }
+  }
+
+  /** Evict a single slot from the pool */
+  private async evictSlot(slotId: string, isDegraded: boolean): Promise<void> {
+    if (isDegraded) {
+      this.localSlots.delete(slotId);
+      this.log.debug({ slotId }, 'Evicted local slot (degraded)');
+      this.emit('slot_evicted', `Evicted slot ${slotId} (degraded)`);
+      return;
+    }
+
+    const redis = this.getRedis();
+    if (!redis || this.degraded) {
+      this.localSlots.delete(slotId);
+      return;
+    }
+
+    await redis.eval(
+      EVICT_SLOT_LUA,
+      2,
+      slotsKey(this.account),
+      slotKey(this.account, slotId),
+      slotId,
+    );
+    this.log.debug({ slotId }, 'Evicted pool slot');
+    this.emit('slot_evicted', `Evicted slot ${slotId}`);
+  }
+
+  /** Evict all slots from the pool (lockout scenario) */
+  private async evictAllSlots(): Promise<void> {
+    const redis = this.getRedis();
+    if (!redis || this.degraded) {
+      this.localSlots.clear();
+      return;
+    }
+
+    const slotIds = await redis.smembers(slotsKey(this.account));
+    for (const sid of slotIds) {
+      await this.evictSlot(sid, false);
+    }
+    this.log.warn({ account: this.account, evicted: slotIds.length }, 'Evicted all pool slots');
+  }
+
+  /** Check if error is a 401 Unauthorized */
+  private is401Error(err: unknown): boolean {
+    return (err as any)?.statusCode === 401;
+  }
+
+  /** Get pool status */
+  async status(): Promise<PoolStatus> {
+    const redis = this.getRedis();
+
+    // Redis mode: read from Redis
+    if (redis && !this.degraded) {
+      const now = Date.now();
+      let activeSlots = 0;
+      let checkedOut = 0;
+      const slots: PoolStatus['slots'] = [];
+
+      const slotIds = await redis.smembers(slotsKey(this.account));
+      for (const sid of slotIds) {
+        const slotData = await redis.hgetall(slotKey(this.account, sid));
+        if (!slotData || !slotData.createdAt) continue;
+        activeSlots++;
+        const isCheckedOut = slotData.checkedOutBy !== '';
+        if (isCheckedOut) checkedOut++;
+        slots.push({
+          id: sid,
+          ageMs: now - parseInt(slotData.createdAt, 10),
+          checkedOutBy: slotData.checkedOutBy,
+          idle: !isCheckedOut,
+        });
+      }
+
+      return {
+        account: this.account,
+        maxSize: this.maxSize,
+        activeSlots,
+        checkedOut,
+        available: activeSlots - checkedOut,
+        circuitBreaker: this.circuitBreaker.currentState,
+        degraded: false,
+        slots,
+      };
+    }
+
+    // Degraded mode: report from local state
+    let activeSlots = 0;
+    let checkedOut = 0;
+    const slots: PoolStatus['slots'] = [];
+
+    for (const [sid, slot] of this.localSlots) {
+      activeSlots++;
+      const isCheckedOut = slot.checkedOutBy !== '';
+      if (isCheckedOut) checkedOut++;
+      slots.push({
+        id: sid,
+        ageMs: Date.now() - slot.createdAt,
+        checkedOutBy: slot.checkedOutBy,
+        idle: !isCheckedOut,
+      });
+    }
+
+    return {
+      account: this.account,
+      maxSize: this.maxSize,
+      activeSlots,
+      checkedOut,
+      available: activeSlots - checkedOut,
+      circuitBreaker: this.circuitBreaker.currentState,
+      degraded: this.degraded || !this.redisUrl,
+      slots,
+    };
+  }
+
+  /** Degraded checkout: login directly, track locally, enforce capacity */
+  private async degradedCheckout(): Promise<SessionHandle> {
+    const started = Date.now();
+
+    while (true) {
+      const now = Date.now();
+
+      // Try to reuse a local available slot, or reclaim stale
+      for (const [sid, slot] of this.localSlots) {
+        if (slot.checkedOutBy === '') {
+          slot.checkedOutBy = this.serviceId;
+          slot.checkedOutAt = now;
+          this.log.debug({ slotId: sid }, 'Reused local slot (degraded)');
+          return {
+            slotId: sid,
+            cookie: slot.cookie,
+            checkedOutBy: this.serviceId,
+            checkedOutAt: now,
+            degraded: true,
+          };
+        }
+        // Check for stale checkout
+        if (slot.checkedOutAt > 0 && (now - slot.checkedOutAt) > this.staleCheckoutMs) {
+          slot.checkedOutBy = this.serviceId;
+          slot.checkedOutAt = now;
+          this.log.debug({ slotId: sid }, 'Reclaimed stale local slot (degraded)');
+          this.emit('stale_reclaimed', `Reclaimed stale slot ${sid}`);
+          return {
+            slotId: sid,
+            cookie: slot.cookie,
+            checkedOutBy: this.serviceId,
+            checkedOutAt: now,
+            degraded: true,
+          };
+        }
+      }
+
+      // Under capacity — login and create new slot
+      if (this.localSlots.size < this.maxSize) {
+        const cookie = await this.loginToAcumatica();
+        const slotId = `degraded-${randomUUID().slice(0, 8)}`;
+        this.localSlots.set(slotId, {
+          cookie,
+          checkedOutBy: this.serviceId,
+          checkedOutAt: now,
+          createdAt: now,
+        });
+        return {
+          slotId,
+          cookie,
+          checkedOutBy: this.serviceId,
+          checkedOutAt: now,
+          degraded: true,
+        };
+      }
+
+      // At capacity — wait with backpressure
+      const elapsed = now - started;
+      if (elapsed > this.checkoutTimeoutMs) {
+        this.emit('pool_exhausted', `Timeout after ${elapsed}ms — all ${this.maxSize} slots checked out (degraded)`);
+        throw new SessionPoolExhaustedError(this.account, elapsed);
+      }
+
+      await new Promise((r) => setTimeout(r, this.pollIntervalMs));
+    }
+  }
+}
