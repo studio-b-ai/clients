@@ -441,16 +441,22 @@ export class AcumaticaClient {
     return unwrap(JSON.parse(res.body));
   }
 
+  /** Basic Auth header for OData — Acumatica cloud OData rejects cookie auth */
+  private get odataBasicAuth(): Record<string, string> {
+    const creds = Buffer.from(`${this.username}:${this.password}`).toString('base64');
+    // Explicitly clear Cookie header — OData rejects mixed auth (Cookie + Basic)
+    return { Authorization: `Basic ${creds}`, Cookie: '' };
+  }
+
   /**
    * GET OData endpoint for Generic Inquiries.
    * GI OData is at /odata/{giName}, NOT /entity/.../{giName}.
-   * Uses the same session cookie as the entity API.
+   * Uses Basic Auth (not session cookies) — Acumatica cloud OData requires it.
    */
   async getOData(
     giName: string,
     params?: Record<string, string | number>,
   ): Promise<unknown> {
-    await this.ensureLoggedIn();
     this.callCounter.tick();
     if (this.callCounter.isOverBudget()) {
       throw new Error(
@@ -469,19 +475,11 @@ export class AcumaticaClient {
       }
     }
 
-    const res = await this.httpRequest('GET', url.toString());
+    const res = await this.httpRequest('GET', url.toString(), undefined, this.odataBasicAuth);
 
     if (res.status === 401) {
-      this.log.warn('OData session expired, re-authenticating');
-      this.loggedIn = false;
-      this.cookies = '';
-      await this.ensureLoggedIn();
-      const retry = await this.httpRequest('GET', url.toString());
-      if (retry.status >= 400) {
-        return this.handleError(retry.status, retry.body, url.toString());
-      }
-      const json = JSON.parse(retry.body);
-      return json.value ?? json;
+      this.log.warn('OData Basic Auth rejected (401) — check credentials');
+      return this.handleError(res.status, res.body, url.toString());
     }
 
     if (res.status >= 400) {
