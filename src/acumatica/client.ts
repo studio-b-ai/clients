@@ -44,6 +44,7 @@ export class CallCounter {
     }
     if (now - this.dayStart > 86_400_000) {
       this.perDay = 0;
+      this.perCycle = 0; // reset cycle counter daily to prevent accumulation
       this.dayStart = now;
     }
   }

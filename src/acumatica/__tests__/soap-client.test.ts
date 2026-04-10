@@ -443,4 +443,128 @@ describe('SoapClient', () => {
       expect(mockRequest).toHaveBeenCalledTimes(3);
     });
   });
+
+  // -- export() -----------------------------------------------------------
+
+  const EXPORT_SUCCESS_BODY = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <ExportResponse xmlns="http://www.acumatica.com/typed/">
+      <ExportResult>
+        <ArrayOfString>
+          <string>Operation</string>
+          <string>ChangeDate</string>
+          <string>UserName</string>
+          <string>BatchID</string>
+        </ArrayOfString>
+        <ArrayOfString>
+          <string>Update</string>
+          <string>3/26/2026 2:15:00 PM</string>
+          <string>sarah</string>
+          <string>42</string>
+        </ArrayOfString>
+        <ArrayOfString>
+          <string>Insert</string>
+          <string>3/26/2026 3:00:00 PM</string>
+          <string>kevin</string>
+          <string>43</string>
+        </ArrayOfString>
+      </ExportResult>
+    </ExportResponse>
+  </soap:Body>
+</soap:Envelope>`;
+
+  const EXPORT_EMPTY_BODY = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <ExportResponse xmlns="http://www.acumatica.com/typed/">
+      <ExportResult />
+    </ExportResponse>
+  </soap:Body>
+</soap:Envelope>`;
+
+  describe('exportScreen()', () => {
+    it('sends Export SOAPAction and parses ArrayOfString rows', async () => {
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, LOGIN_SUCCESS_BODY, {
+          'set-cookie': '.ASPXAUTH=abc123; path=/',
+        }),
+      );
+      await client.login('SM205530');
+      vi.clearAllMocks();
+
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, EXPORT_SUCCESS_BODY),
+      );
+
+      const commands: SoapCommand[] = [
+        { fieldName: 'ScreenID', objectName: 'Filter', value: 'SO301000', commit: true, type: 'Value' },
+        { fieldName: 'Operation', objectName: 'Changes', type: 'Field' },
+        { fieldName: 'ChangeDate', objectName: 'Changes', type: 'Field' },
+        { fieldName: 'UserName', objectName: 'Changes', type: 'Field' },
+        { fieldName: 'BatchID', objectName: 'Changes', type: 'Field' },
+      ];
+
+      const rows = await client.exportScreen('SM205530', commands, 5000);
+
+      expect(mockRequest).toHaveBeenCalledTimes(1);
+      const [url, opts] = mockRequest.mock.calls[0]!;
+      expect(url).toBe('https://test.acumatica.com/Soap/SM205530.asmx');
+      expect(opts.headers.SOAPAction).toBe('"http://www.acumatica.com/typed/Export"');
+      expect(opts.headers['Cookie']).toBe('.ASPXAUTH=abc123');
+
+      expect(opts.body).toContain('<tns:Export>');
+      expect(opts.body).toContain('<tns:topCount>5000</tns:topCount>');
+      expect(opts.body).toContain('<tns:includeHeaders>true</tns:includeHeaders>');
+
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toEqual({
+        Operation: 'Update',
+        ChangeDate: '3/26/2026 2:15:00 PM',
+        UserName: 'sarah',
+        BatchID: '42',
+      });
+      expect(rows[1]).toEqual({
+        Operation: 'Insert',
+        ChangeDate: '3/26/2026 3:00:00 PM',
+        UserName: 'kevin',
+        BatchID: '43',
+      });
+    });
+
+    it('returns empty array when no data rows', async () => {
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, LOGIN_SUCCESS_BODY, {
+          'set-cookie': '.ASPXAUTH=abc123; path=/',
+        }),
+      );
+      await client.login('SM205530');
+      vi.clearAllMocks();
+
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, EXPORT_EMPTY_BODY),
+      );
+
+      const rows = await client.exportScreen('SM205530', [], 100);
+      expect(rows).toEqual([]);
+    });
+
+    it('throws on SOAP fault', async () => {
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, LOGIN_SUCCESS_BODY, {
+          'set-cookie': '.ASPXAUTH=abc123; path=/',
+        }),
+      );
+      await client.login('SM205530');
+      vi.clearAllMocks();
+
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, SOAP_FAULT_BODY),
+      );
+
+      await expect(
+        client.exportScreen('SM205530', [], 100),
+      ).rejects.toThrow('SOAP Export fault: Record not found');
+    });
+  });
 });

@@ -159,6 +159,43 @@ ${commandsXml}
 </soap:Envelope>`;
 }
 
+function buildExportXml(commands: SoapCommand[], topCount: number): string {
+  const commandsXml = commands
+    .map((cmd) => {
+      const xsiType = cmd.type ?? (cmd.value !== undefined ? 'Value' : 'Field');
+      const parts: string[] = [];
+      parts.push(`        <tns:Command xsi:type="tns:${xsiType}">`);
+      parts.push(`          <tns:FieldName>${escapeXml(cmd.fieldName)}</tns:FieldName>`);
+      parts.push(`          <tns:ObjectName>${escapeXml(cmd.objectName)}</tns:ObjectName>`);
+      if (cmd.value !== undefined) {
+        parts.push(`          <tns:Value>${escapeXml(cmd.value)}</tns:Value>`);
+      }
+      if (cmd.commit) {
+        parts.push(`          <tns:Commit>true</tns:Commit>`);
+      }
+      parts.push(`        </tns:Command>`);
+      return parts.join('\n');
+    })
+    .join('\n');
+
+  return `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:tns="http://www.acumatica.com/typed/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <soap:Body>
+    <tns:Export>
+      <tns:commands>
+${commandsXml}
+      </tns:commands>
+      <tns:filters />
+      <tns:topCount>${topCount}</tns:topCount>
+      <tns:includeHeaders>true</tns:includeHeaders>
+      <tns:breakOnError>true</tns:breakOnError>
+    </tns:Export>
+  </soap:Body>
+</soap:Envelope>`;
+}
+
 /** Escape special characters for XML text content. */
 function escapeXml(str: string): string {
   return str
@@ -167,6 +204,31 @@ function escapeXml(str: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
+}
+
+/** Parse SOAP Export response into array of keyed objects. Row 0 = headers. */
+function parseExportResponse(xml: string): Record<string, string>[] {
+  const arrayMatches = xml.match(/<ArrayOfString>([\s\S]*?)<\/ArrayOfString>/g);
+  if (!arrayMatches || arrayMatches.length < 2) return [];
+
+  const headerMatch = arrayMatches[0]!.match(/<string>([^<]*)<\/string>/g);
+  const headers = headerMatch?.map((m) => m.replace(/<\/?string>/g, '')) ?? [];
+  if (headers.length === 0) return [];
+
+  const rows: Record<string, string>[] = [];
+  for (let i = 1; i < arrayMatches.length; i++) {
+    const valMatch = arrayMatches[i]!.match(/<string>([^<]*)<\/string>/g);
+    const vals = valMatch?.map((m) => m.replace(/<\/?string>/g, '')) ?? [];
+    if (vals.length === 0 || vals.every((v) => !v)) continue;
+
+    const row: Record<string, string> = {};
+    for (let j = 0; j < headers.length; j++) {
+      row[headers[j]!] = vals[j] ?? '';
+    }
+    rows.push(row);
+  }
+
+  return rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +319,28 @@ export class SoapClient {
     const res = await this.soapRequest(url, 'Submit', body);
     this.checkFault(res.body, 'Submit');
     return res.body;
+  }
+
+  /**
+   * Export data from a screen via SOAP Export API.
+   * Returns parsed rows as keyed objects (header names as keys).
+   * Must call login() first with the target screenID.
+   */
+  async exportScreen(
+    screenID: string,
+    commands: SoapCommand[],
+    topCount = 5000,
+  ): Promise<Record<string, string>[]> {
+    const url = this.soapUrl(screenID);
+    const body = buildExportXml(commands, topCount);
+
+    this.log.debug({ screenID, commandCount: commands.length, topCount }, 'SOAP Export');
+    const res = await this.soapRequest(url, 'Export', body);
+    this.checkFault(res.body, 'Export');
+
+    const rows = parseExportResponse(res.body);
+    this.log.info({ screenID, rowCount: rows.length }, 'SOAP Export complete');
+    return rows;
   }
 
   /**
