@@ -2,6 +2,33 @@ export interface HubSpotClientConfig {
   accessToken: string;
 }
 
+// Mirrors HubSpot CRM Search API filter structure
+export interface HubSpotFilter {
+  propertyName: string;
+  operator: string;
+  value?: string;
+  values?: string[];
+  highValue?: string;
+}
+
+export interface HubSpotFilterGroup {
+  filters: HubSpotFilter[];
+}
+
+export interface HubSpotSearchSort {
+  propertyName: string;
+  direction: 'ASCENDING' | 'DESCENDING';
+}
+
+export interface HubSpotSearchOpts {
+  query?: string;
+  filterGroups?: HubSpotFilterGroup[];
+  properties?: string[];
+  limit?: number;
+  sorts?: HubSpotSearchSort[];
+  after?: string;
+}
+
 export class HubSpotClient {
   private config: HubSpotClientConfig;
   private apiBase = 'https://api.hubapi.com';
@@ -27,13 +54,42 @@ export class HubSpotClient {
     return res.json() as Promise<T>;
   }
 
-  // Contacts
-  async searchContacts(opts: { query?: string; filterGroups?: any[]; properties?: string[]; limit?: number }) {
-    return this.fetch<any>('POST', '/crm/v3/objects/contacts/search', {
-      query: opts.query, filterGroups: opts.filterGroups,
-      properties: opts.properties ?? ['email', 'firstname', 'lastname', 'phone', 'company'],
+  /**
+   * Build a clean search body for the HubSpot CRM Search API.
+   * Only includes keys that have a defined value so that HubSpot doesn't
+   * misinterpret an explicit `undefined` / `null` as an empty filter set.
+   */
+  private buildSearchBody(opts: HubSpotSearchOpts, defaultProperties: string[]): Record<string, unknown> {
+    const body: Record<string, unknown> = {
       limit: opts.limit ?? 10,
-    });
+      properties: opts.properties ?? defaultProperties,
+    };
+
+    // Include only when provided — a missing filterGroups key means "no filter"
+    // (returns all results), which is the correct HubSpot default behaviour.
+    if (opts.filterGroups !== undefined) {
+      // Ensure all filter values are strings as required by the HubSpot API
+      body.filterGroups = opts.filterGroups.map((group) => ({
+        filters: group.filters.map((f) => ({
+          ...f,
+          ...(f.value !== undefined ? { value: String(f.value) } : {}),
+          ...(f.values !== undefined ? { values: f.values.map(String) } : {}),
+          ...(f.highValue !== undefined ? { highValue: String(f.highValue) } : {}),
+        })),
+      }));
+    }
+
+    if (opts.query !== undefined) body.query = opts.query;
+    if (opts.sorts !== undefined) body.sorts = opts.sorts;
+    if (opts.after !== undefined) body.after = opts.after;
+
+    return body;
+  }
+
+  // Contacts
+  async searchContacts(opts: HubSpotSearchOpts) {
+    const body = this.buildSearchBody(opts, ['email', 'firstname', 'lastname', 'phone', 'company']);
+    return this.fetch<any>('POST', '/crm/v3/objects/contacts/search', body);
   }
 
   async getContact(contactId: string, properties?: string[]) {
@@ -50,12 +106,9 @@ export class HubSpotClient {
   }
 
   // Companies
-  async searchCompanies(opts: { query?: string; filterGroups?: any[]; properties?: string[]; limit?: number }) {
-    return this.fetch<any>('POST', '/crm/v3/objects/companies/search', {
-      query: opts.query, filterGroups: opts.filterGroups,
-      properties: opts.properties ?? ['name', 'domain', 'industry', 'numberofemployees'],
-      limit: opts.limit ?? 10,
-    });
+  async searchCompanies(opts: HubSpotSearchOpts) {
+    const body = this.buildSearchBody(opts, ['name', 'domain', 'industry', 'numberofemployees']);
+    return this.fetch<any>('POST', '/crm/v3/objects/companies/search', body);
   }
 
   async getCompany(companyId: string, properties?: string[]) {
@@ -64,12 +117,9 @@ export class HubSpotClient {
   }
 
   // Deals
-  async searchDeals(opts: { query?: string; filterGroups?: any[]; properties?: string[]; limit?: number }) {
-    return this.fetch<any>('POST', '/crm/v3/objects/deals/search', {
-      query: opts.query, filterGroups: opts.filterGroups,
-      properties: opts.properties ?? ['dealname', 'amount', 'dealstage', 'pipeline', 'closedate'],
-      limit: opts.limit ?? 10,
-    });
+  async searchDeals(opts: HubSpotSearchOpts) {
+    const body = this.buildSearchBody(opts, ['dealname', 'amount', 'dealstage', 'pipeline', 'closedate']);
+    return this.fetch<any>('POST', '/crm/v3/objects/deals/search', body);
   }
 
   async getDeal(dealId: string, properties?: string[]) {
@@ -78,12 +128,9 @@ export class HubSpotClient {
   }
 
   // Tickets
-  async searchTickets(opts: { query?: string; filterGroups?: any[]; properties?: string[]; limit?: number }) {
-    return this.fetch<any>('POST', '/crm/v3/objects/tickets/search', {
-      query: opts.query, filterGroups: opts.filterGroups,
-      properties: opts.properties ?? ['subject', 'content', 'hs_pipeline', 'hs_pipeline_stage', 'hs_ticket_priority'],
-      limit: opts.limit ?? 10,
-    });
+  async searchTickets(opts: HubSpotSearchOpts) {
+    const body = this.buildSearchBody(opts, ['subject', 'content', 'hs_pipeline', 'hs_pipeline_stage', 'hs_ticket_priority']);
+    return this.fetch<any>('POST', '/crm/v3/objects/tickets/search', body);
   }
 
   async getTicket(ticketId: string, properties?: string[]) {
@@ -110,12 +157,17 @@ export class HubSpotClient {
     return this.fetch<any>('GET', `/crm/v3/pipelines/${objectType}`);
   }
 
-  // Generic CRM search
-  async searchObjects(objectType: string, opts: { query?: string; filterGroups?: any[]; properties?: string[]; limit?: number; sorts?: any[] }) {
-    return this.fetch<any>('POST', `/crm/v3/objects/${objectType}/search`, {
-      query: opts.query, filterGroups: opts.filterGroups,
-      properties: opts.properties, limit: opts.limit ?? 10, sorts: opts.sorts,
-    });
+  // Generic CRM search — the primary fix target
+  async searchObjects(objectType: string, opts: HubSpotSearchOpts) {
+    const body = this.buildSearchBody(opts, []);
+
+    // Debug logging: always log outbound body so filter passthrough can be verified
+    console.debug(
+      `[HubSpot] POST /crm/v3/objects/${objectType}/search`,
+      JSON.stringify(body, null, 2)
+    );
+
+    return this.fetch<any>('POST', `/crm/v3/objects/${objectType}/search`, body);
   }
 
   async getObject(objectType: string, objectId: string, properties?: string[]) {
