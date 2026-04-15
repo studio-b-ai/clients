@@ -79,7 +79,10 @@ export class HubSpotClient {
       }));
     }
 
-    if (opts.query !== undefined) body.query = opts.query;
+    // Only include query when it has a non-empty value.
+    // HubSpot silently ignores filterGroups whenever query is present in the
+    // body — even as an empty string.  Omitting the key is the safe default.
+    if (opts.query !== undefined && opts.query.trim() !== '') body.query = opts.query;
     if (opts.sorts !== undefined) body.sorts = opts.sorts;
     if (opts.after !== undefined) body.after = opts.after;
 
