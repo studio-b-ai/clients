@@ -257,7 +257,11 @@ describe('triggerDeploy auto-detect', () => {
     expect(body.query).not.toContain('deploymentCreate');
   });
 
-  it('takes the REDEPLOY path when the service has prior deployments', async () => {
+  it('takes the REDEPLOY path and returns the fresh deploymentId (not empty)', async () => {
+    // Rehearsal 2026-04-17 caught: the old code returned deploymentId=''
+    // forcing the skill to do a redundant railway_get_deployments call.
+    // Now the client does that fetch internally after the redeploy
+    // mutation succeeds, so callers always get a usable deploymentId.
     const fetchMock = mockFetch([
       {
         data: {
@@ -269,11 +273,20 @@ describe('triggerDeploy auto-detect', () => {
         },
       },
       { data: { serviceInstanceRedeploy: true } },
+      {
+        data: {
+          deployments: {
+            edges: [
+              { node: { id: 'd-fresh-redeploy', status: 'BUILDING', createdAt: '2026-04-17T00:00:00Z' } },
+            ],
+          },
+        },
+      },
     ]);
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await newClient().triggerDeploy('svc-2', 'env-2');
-    expect(result).toEqual({ deploymentId: '', path: 'redeploy' });
+    expect(result).toEqual({ deploymentId: 'd-fresh-redeploy', path: 'redeploy' });
 
     const body = JSON.parse((fetchMock.mock.calls[1]![1] as RequestInit).body as string);
     expect(body.query).toContain('serviceInstanceRedeploy');
@@ -413,7 +426,18 @@ describe('DEPLOYMENT_TERMINAL_STATES', () => {
 describe('attachCustomDomain', () => {
   beforeEach(() => vi.unstubAllGlobals());
 
-  it('returns the CustomDomain object from customDomainCreate', async () => {
+  // Railway returns `status` as the CustomDomainStatus OBJECT type
+  // (not a scalar). `syncStatus` is an enum. The prior query selected
+  // `status` as a bare field and 400'd. Fixed as of PR #28.
+  const statusObj = {
+    certificateStatus: 'ISSUING',
+    verified: false,
+    verificationDnsHost: 'verify.railway.app',
+    verificationToken: 'tok-123',
+    certificateErrorMessage: null,
+  };
+
+  it('returns the CustomDomain object from customDomainCreate (status is an object, syncStatus is an enum)', async () => {
     vi.stubGlobal(
       'fetch',
       mockFetch([
@@ -422,8 +446,8 @@ describe('attachCustomDomain', () => {
             customDomainCreate: {
               id: 'cd-1',
               domain: 'roth.bolt.b.studio',
-              status: 'WAITING',
-              syncStatus: 'WAITING',
+              status: statusObj,
+              syncStatus: 'CREATING',
               projectId: 'p-roth',
               serviceId: 'svc-bolt-wms',
               environmentId: 'env-prod',
@@ -443,8 +467,44 @@ describe('attachCustomDomain', () => {
     });
 
     expect(result.domain).toBe('roth.bolt.b.studio');
-    expect(result.status).toBe('WAITING');
-    expect(result.syncStatus).toBe('WAITING');
+    expect(result.status.certificateStatus).toBe('ISSUING');
+    expect(result.status.verified).toBe(false);
+    expect(result.syncStatus).toBe('CREATING');
+  });
+
+  it('selects status subfields (not as a bare scalar)', async () => {
+    const fetchMock = mockFetch([
+      {
+        data: {
+          customDomainCreate: {
+            id: 'cd-1',
+            domain: 'x.b.studio',
+            status: statusObj,
+            syncStatus: 'CREATING',
+            projectId: 'p',
+            serviceId: 's',
+            environmentId: 'e',
+            targetPort: null,
+            createdAt: '2026-04-16T00:00:00Z',
+          },
+        },
+      },
+    ]);
+    vi.stubGlobal('fetch', fetchMock);
+
+    await newClient().attachCustomDomain({
+      projectId: 'p',
+      serviceId: 's',
+      environmentId: 'e',
+      domain: 'x.b.studio',
+    });
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    // Must select subfields of `status { ... }` — Railway changed the type.
+    expect(body.query).toMatch(/status\s*\{/);
+    expect(body.query).toContain('certificateStatus');
+    expect(body.query).toContain('verified');
+    // syncStatus is an enum — should NOT have a subselection
+    expect(body.query).not.toMatch(/syncStatus\s*\{/);
   });
 
   it('sends all four required inputs (domain + projectId + serviceId + environmentId)', async () => {
@@ -454,8 +514,8 @@ describe('attachCustomDomain', () => {
           customDomainCreate: {
             id: 'cd-1',
             domain: 'roth.bolt.b.studio',
-            status: 'WAITING',
-            syncStatus: 'WAITING',
+            status: statusObj,
+            syncStatus: 'CREATING',
             projectId: 'p',
             serviceId: 's',
             environmentId: 'e',
@@ -491,8 +551,8 @@ describe('attachCustomDomain', () => {
           customDomainCreate: {
             id: 'cd-1',
             domain: 'foo.b.studio',
-            status: 'WAITING',
-            syncStatus: 'WAITING',
+            status: statusObj,
+            syncStatus: 'CREATING',
             projectId: 'p',
             serviceId: 's',
             environmentId: 'e',
@@ -523,8 +583,8 @@ describe('attachCustomDomain', () => {
           customDomainCreate: {
             id: 'cd-1',
             domain: 'foo.b.studio',
-            status: 'WAITING',
-            syncStatus: 'WAITING',
+            status: statusObj,
+            syncStatus: 'CREATING',
             projectId: 'p',
             serviceId: 's',
             environmentId: 'e',
@@ -545,6 +605,75 @@ describe('attachCustomDomain', () => {
 
     const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
     expect(body.variables.input).not.toHaveProperty('targetPort');
+  });
+});
+
+describe('createServiceDomain defensive check (rehearsal bug 2)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  it('throws when Railway returns a domain attached to a different serviceId', async () => {
+    vi.stubGlobal(
+      'fetch',
+      mockFetch([
+        {
+          data: {
+            serviceDomainCreate: {
+              id: 'sd-1',
+              domain: 'bolt-wms-production.up.railway.app',
+              environmentId: 'env-prod',
+              serviceId: 'HERITAGE_SERVICE_ID', // mismatch with requested
+            },
+          },
+        },
+      ]),
+    );
+
+    await expect(
+      newClient().createServiceDomain('THROWAWAY_SERVICE_ID', 'env-prod'),
+    ).rejects.toThrow(/serviceId=HERITAGE_SERVICE_ID/i);
+  });
+
+  it('throws when Railway returns a domain in a different environment', async () => {
+    vi.stubGlobal(
+      'fetch',
+      mockFetch([
+        {
+          data: {
+            serviceDomainCreate: {
+              id: 'sd-1',
+              domain: 'ok.up.railway.app',
+              environmentId: 'wrong-env',
+              serviceId: 'svc',
+            },
+          },
+        },
+      ]),
+    );
+
+    await expect(
+      newClient().createServiceDomain('svc', 'expected-env'),
+    ).rejects.toThrow(/environmentId=wrong-env/i);
+  });
+
+  it('returns the domain when serviceId + environmentId both match', async () => {
+    vi.stubGlobal(
+      'fetch',
+      mockFetch([
+        {
+          data: {
+            serviceDomainCreate: {
+              id: 'sd-1',
+              domain: 'bolt-wms-production-7a3e.up.railway.app',
+              environmentId: 'env-prod',
+              serviceId: 'svc',
+            },
+          },
+        },
+      ]),
+    );
+
+    const result = await newClient().createServiceDomain('svc', 'env-prod');
+    expect(result.domain).toBe('bolt-wms-production-7a3e.up.railway.app');
   });
 });
 

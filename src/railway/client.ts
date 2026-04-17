@@ -154,13 +154,40 @@ export interface DeploymentStatusResult {
   updatedAt: string;
 }
 
+export interface CustomDomainStatus {
+  /**
+   * SSL cert lifecycle. Typical: `WAITING` → `ISSUING` → `ISSUED`, or
+   * `FAILED` on verification error (see certificateErrorMessage).
+   */
+  certificateStatus: string;
+  /**
+   * Whether DNS verification has completed. When false, the operator
+   * must ensure the CNAME/A record points at verificationDnsHost and
+   * optionally the TXT record is set per verificationToken.
+   */
+  verified: boolean;
+  /** Railway's expected DNS target (CNAME value). */
+  verificationDnsHost?: string | null;
+  /** Optional TXT-record token for verification. */
+  verificationToken?: string | null;
+  certificateErrorMessage?: string | null;
+}
+
+export type CustomDomainSyncStatus =
+  | 'ACTIVE'
+  | 'CREATING'
+  | 'UPDATING'
+  | 'DELETING'
+  | 'DELETED'
+  | 'UNSPECIFIED';
+
 export interface CustomDomainResult {
   id: string;
   domain: string;
-  /** Provisioning status — typically `WAITING` → `UPDATING` → `ACTIVE`. */
-  status: string;
-  /** DNS / cert sync status — `WAITING`, `SYNCED`, `ERROR`, etc. */
-  syncStatus: string;
+  /** Cert + verification state — object, NOT a scalar. */
+  status: CustomDomainStatus;
+  /** Railway-side sync state, enum. Wait for `ACTIVE`. */
+  syncStatus: CustomDomainSyncStatus;
   projectId: string;
   serviceId: string;
   environmentId: string;
@@ -326,7 +353,14 @@ export class RailwayClient {
     if (!data.serviceInstanceRedeploy) {
       throw new Error('[railway] serviceInstanceRedeploy returned false');
     }
-    return { deploymentId: '', path: 'redeploy' };
+    // After the redeploy mutation succeeds, Railway has created a new
+    // deployment but `serviceInstanceRedeploy` returns only a Boolean.
+    // Fetch the freshest deploymentId so the caller can poll it.
+    // Without this, the skill (bolt-deploy-tenant) has to do a second
+    // `railway_get_deployments` call just to find the id.
+    const fresh = await this.getLatestDeployments(serviceId, environmentId, 1);
+    const newDeploymentId = fresh[0]?.id ?? '';
+    return { deploymentId: newDeploymentId, path: 'redeploy' };
   }
 
   /**
@@ -619,7 +653,13 @@ export class RailwayClient {
   }
 
   /**
-   * Generate a Railway service domain (*.up.railway.app).
+   * Generate a Railway service domain (*.up.railway.app). Defensive:
+   * validates Railway returned a domain attached to the requested
+   * serviceId. Rehearsal (2026-04-17) saw a cross-tenant leak where a
+   * first call returned a DIFFERENT service's domain — root cause
+   * unclear (operator-error or Railway edge case), but verifying the
+   * response matches the request prevents a tenant deploy from ever
+   * pointing its CNAME at another tenant's host.
    */
   async createServiceDomain(
     serviceId: string,
@@ -643,7 +683,23 @@ export class RailwayClient {
       environmentId,
     });
 
-    return data.serviceDomainCreate;
+    const result = data.serviceDomainCreate;
+    if (result.serviceId !== serviceId) {
+      throw new Error(
+        `[railway] serviceDomainCreate returned a domain attached to serviceId=${result.serviceId} ` +
+          `but the request targeted serviceId=${serviceId}. Refusing to return it. ` +
+          `This could indicate operator error (wrong serviceId passed) or a Railway-side match. ` +
+          `Do NOT point DNS at ${result.domain} for the requested service.`,
+      );
+    }
+    if (result.environmentId !== environmentId) {
+      throw new Error(
+        `[railway] serviceDomainCreate returned a domain in environmentId=${result.environmentId} ` +
+          `but the request targeted environmentId=${environmentId}. Refusing to return it.`,
+      );
+    }
+
+    return result;
   }
 
   /**
@@ -669,12 +725,23 @@ export class RailwayClient {
     domain: string;
     targetPort?: number;
   }): Promise<CustomDomainResult> {
+    // CustomDomain.status is the CustomDomainStatus OBJECT type (fields:
+    // certificateStatus, dnsRecords, verified, verificationDnsHost,
+    // verificationToken, etc.) — not a scalar. Selecting `status` as a
+    // bare field 400s. syncStatus is an enum (ACTIVE/CREATING/UPDATING/
+    // DELETING/DELETED/UNSPECIFIED) — scalar selection is fine.
     const query = `
       mutation($input: CustomDomainCreateInput!) {
         customDomainCreate(input: $input) {
           id
           domain
-          status
+          status {
+            certificateStatus
+            verified
+            verificationDnsHost
+            verificationToken
+            certificateErrorMessage
+          }
           syncStatus
           projectId
           serviceId
