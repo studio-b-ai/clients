@@ -407,9 +407,15 @@ export class RailwayClient {
 
   async listVariableNames(
     serviceId: string,
-    environmentId: string
+    environmentId: string,
+    projectId?: string,
   ): Promise<string[]> {
-    const projectId = this.requireProjectId();
+    const effectiveProjectId = projectId ?? this.projectId;
+    if (!effectiveProjectId) {
+      throw new Error(
+        'RailwayClient.listVariableNames: projectId is required — pass it or set it on the client.',
+      );
+    }
     const query = `
       query($projectId: String!, $serviceId: String!, $environmentId: String!) {
         variables(
@@ -420,7 +426,7 @@ export class RailwayClient {
       }
     `;
     const data = await this.gql<{ variables: Record<string, string> }>(query, {
-      projectId,
+      projectId: effectiveProjectId,
       serviceId,
       environmentId,
     });
@@ -460,14 +466,27 @@ export class RailwayClient {
    * Upsert a single environment variable for a service.
    * WRITE-ONLY: values are set but never read back.
    * After setting, the service needs a deploy to pick up the change.
+   *
+   * **projectId resolution:** Railway's VariableUpsertInput requires
+   * `projectId` (NON_NULL). Tenant-deploy callers (bolt-deploy-tenant
+   * skill) operate on brand-new projects that aren't the client's
+   * configured default, so `projectId` is accepted as an optional
+   * parameter and takes precedence over `this.projectId`. If neither
+   * is set the call throws.
    */
   async upsertVariable(
     serviceId: string,
     environmentId: string,
     name: string,
-    value: string
+    value: string,
+    projectId?: string,
   ): Promise<boolean> {
-    const projectId = this.requireProjectId();
+    const effectiveProjectId = projectId ?? this.projectId;
+    if (!effectiveProjectId) {
+      throw new Error(
+        'RailwayClient.upsertVariable: projectId is required — either pass it as the 5th argument or set projectId on the client constructor.',
+      );
+    }
     const query = `
       mutation($input: VariableUpsertInput!) {
         variableUpsert(input: $input)
@@ -476,7 +495,7 @@ export class RailwayClient {
 
     const data = await this.gql<{ variableUpsert: boolean }>(query, {
       input: {
-        projectId,
+        projectId: effectiveProjectId,
         serviceId,
         environmentId,
         name,
@@ -488,19 +507,21 @@ export class RailwayClient {
   }
 
   /**
-   * Bulk upsert multiple environment variables.
+   * Bulk upsert multiple environment variables. See `upsertVariable` for
+   * the projectId resolution rules.
    */
   async upsertVariables(
     serviceId: string,
     environmentId: string,
-    variables: Record<string, string>
+    variables: Record<string, string>,
+    projectId?: string,
   ): Promise<{ set: number; failed: string[] }> {
     const failed: string[] = [];
     let set = 0;
 
     for (const [name, value] of Object.entries(variables)) {
       try {
-        await this.upsertVariable(serviceId, environmentId, name, value);
+        await this.upsertVariable(serviceId, environmentId, name, value, projectId);
         set++;
       } catch {
         failed.push(name);
@@ -511,14 +532,21 @@ export class RailwayClient {
   }
 
   /**
-   * Delete an environment variable.
+   * Delete an environment variable. See `upsertVariable` for the
+   * projectId resolution rules.
    */
   async deleteVariable(
     serviceId: string,
     environmentId: string,
-    name: string
+    name: string,
+    projectId?: string,
   ): Promise<boolean> {
-    const projectId = this.requireProjectId();
+    const effectiveProjectId = projectId ?? this.projectId;
+    if (!effectiveProjectId) {
+      throw new Error(
+        'RailwayClient.deleteVariable: projectId is required — either pass it or set projectId on the client constructor.',
+      );
+    }
     const query = `
       mutation($input: VariableDeleteInput!) {
         variableDelete(input: $input)
@@ -527,7 +555,7 @@ export class RailwayClient {
 
     const data = await this.gql<{ variableDelete: boolean }>(query, {
       input: {
-        projectId,
+        projectId: effectiveProjectId,
         serviceId,
         environmentId,
         name,
@@ -544,9 +572,15 @@ export class RailwayClient {
    */
   async listServiceDomains(
     serviceId: string,
-    environmentId: string
+    environmentId: string,
+    projectId?: string,
   ): Promise<ServiceDomain[]> {
-    const projectId = this.requireProjectId();
+    const effectiveProjectId = projectId ?? this.projectId;
+    if (!effectiveProjectId) {
+      throw new Error(
+        'RailwayClient.listServiceDomains: projectId is required — pass it or set it on the client.',
+      );
+    }
     const query = `
       query($projectId: String!, $serviceId: String!, $environmentId: String!) {
         domains(
@@ -576,7 +610,7 @@ export class RailwayClient {
         customDomains: ServiceDomain[];
       };
     }>(query, {
-      projectId,
+      projectId: effectiveProjectId,
       serviceId,
       environmentId,
     });
