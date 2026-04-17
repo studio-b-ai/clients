@@ -142,6 +142,20 @@ export interface DeploymentStatusResult {
   updatedAt: string;
 }
 
+export interface CustomDomainResult {
+  id: string;
+  domain: string;
+  /** Provisioning status — typically `WAITING` → `UPDATING` → `ACTIVE`. */
+  status: string;
+  /** DNS / cert sync status — `WAITING`, `SYNCED`, `ERROR`, etc. */
+  syncStatus: string;
+  projectId: string;
+  serviceId: string;
+  environmentId: string;
+  targetPort?: number | null;
+  createdAt: string;
+}
+
 // ── Client ─────────────────────────────────────────────
 
 export class RailwayClient {
@@ -584,6 +598,55 @@ export class RailwayClient {
     });
 
     return data.serviceDomainCreate;
+  }
+
+  /**
+   * Attach a CUSTOM domain to a service (e.g. `roth.bolt.b.studio`).
+   *
+   * Different from `createServiceDomain` (which generates the
+   * `*.up.railway.app` auto-domain). Requires the operator to have
+   * already configured a CNAME / A record pointing the custom hostname
+   * at Railway — Railway verifies via `status` / `syncStatus` before
+   * issuing SSL.
+   *
+   * Schema: `customDomainCreate(input: CustomDomainCreateInput!): CustomDomain!`
+   * where CustomDomainCreateInput requires `domain`, `projectId`,
+   * `serviceId`, `environmentId` (all NON_NULL) plus optional `targetPort`.
+   *
+   * Returns the full CustomDomain with `status` + `syncStatus` so the
+   * caller can poll/surface cert-issuance progress.
+   */
+  async attachCustomDomain(params: {
+    projectId: string;
+    serviceId: string;
+    environmentId: string;
+    domain: string;
+    targetPort?: number;
+  }): Promise<CustomDomainResult> {
+    const query = `
+      mutation($input: CustomDomainCreateInput!) {
+        customDomainCreate(input: $input) {
+          id
+          domain
+          status
+          syncStatus
+          projectId
+          serviceId
+          environmentId
+          targetPort
+          createdAt
+        }
+      }
+    `;
+    const input: Record<string, unknown> = {
+      projectId: params.projectId,
+      serviceId: params.serviceId,
+      environmentId: params.environmentId,
+      domain: params.domain,
+    };
+    if (params.targetPort !== undefined) input.targetPort = params.targetPort;
+    const data = await this.gql<{ customDomainCreate: CustomDomainResult }>(query, { input });
+    return data.customDomainCreate;
   }
 
   // ── Service Restart ──────────────────────────────────

@@ -366,6 +366,144 @@ describe('DEPLOYMENT_TERMINAL_STATES', () => {
   });
 });
 
+describe('attachCustomDomain', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  it('returns the CustomDomain object from customDomainCreate', async () => {
+    vi.stubGlobal(
+      'fetch',
+      mockFetch([
+        {
+          data: {
+            customDomainCreate: {
+              id: 'cd-1',
+              domain: 'roth.bolt.b.studio',
+              status: 'WAITING',
+              syncStatus: 'WAITING',
+              projectId: 'p-roth',
+              serviceId: 'svc-bolt-wms',
+              environmentId: 'env-prod',
+              targetPort: null,
+              createdAt: '2026-04-16T00:00:00Z',
+            },
+          },
+        },
+      ]),
+    );
+
+    const result = await newClient().attachCustomDomain({
+      projectId: 'p-roth',
+      serviceId: 'svc-bolt-wms',
+      environmentId: 'env-prod',
+      domain: 'roth.bolt.b.studio',
+    });
+
+    expect(result.domain).toBe('roth.bolt.b.studio');
+    expect(result.status).toBe('WAITING');
+    expect(result.syncStatus).toBe('WAITING');
+  });
+
+  it('sends all four required inputs (domain + projectId + serviceId + environmentId)', async () => {
+    const fetchMock = mockFetch([
+      {
+        data: {
+          customDomainCreate: {
+            id: 'cd-1',
+            domain: 'roth.bolt.b.studio',
+            status: 'WAITING',
+            syncStatus: 'WAITING',
+            projectId: 'p',
+            serviceId: 's',
+            environmentId: 'e',
+            targetPort: null,
+            createdAt: '2026-04-16T00:00:00Z',
+          },
+        },
+      },
+    ]);
+    vi.stubGlobal('fetch', fetchMock);
+
+    await newClient().attachCustomDomain({
+      projectId: 'p-roth',
+      serviceId: 'svc-bolt-wms',
+      environmentId: 'env-prod',
+      domain: 'roth.bolt.b.studio',
+    });
+
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.query).toContain('customDomainCreate');
+    expect(body.variables.input).toEqual({
+      projectId: 'p-roth',
+      serviceId: 'svc-bolt-wms',
+      environmentId: 'env-prod',
+      domain: 'roth.bolt.b.studio',
+    });
+  });
+
+  it('includes targetPort when provided', async () => {
+    const fetchMock = mockFetch([
+      {
+        data: {
+          customDomainCreate: {
+            id: 'cd-1',
+            domain: 'foo.b.studio',
+            status: 'WAITING',
+            syncStatus: 'WAITING',
+            projectId: 'p',
+            serviceId: 's',
+            environmentId: 'e',
+            targetPort: 8080,
+            createdAt: '2026-04-16T00:00:00Z',
+          },
+        },
+      },
+    ]);
+    vi.stubGlobal('fetch', fetchMock);
+
+    await newClient().attachCustomDomain({
+      projectId: 'p',
+      serviceId: 's',
+      environmentId: 'e',
+      domain: 'foo.b.studio',
+      targetPort: 8080,
+    });
+
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.variables.input.targetPort).toBe(8080);
+  });
+
+  it('omits targetPort from the mutation input when not provided', async () => {
+    const fetchMock = mockFetch([
+      {
+        data: {
+          customDomainCreate: {
+            id: 'cd-1',
+            domain: 'foo.b.studio',
+            status: 'WAITING',
+            syncStatus: 'WAITING',
+            projectId: 'p',
+            serviceId: 's',
+            environmentId: 'e',
+            targetPort: null,
+            createdAt: '2026-04-16T00:00:00Z',
+          },
+        },
+      },
+    ]);
+    vi.stubGlobal('fetch', fetchMock);
+
+    await newClient().attachCustomDomain({
+      projectId: 'p',
+      serviceId: 's',
+      environmentId: 'e',
+      domain: 'foo.b.studio',
+    });
+
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.variables.input).not.toHaveProperty('targetPort');
+  });
+});
+
 describe('restartService', () => {
   beforeEach(() => vi.unstubAllGlobals());
 
