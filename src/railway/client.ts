@@ -77,9 +77,21 @@ export interface ProjectSummary {
   createdAt: string;
 }
 
+export interface NewProjectEnvironment {
+  id: string;
+  name: string;
+}
+
 export interface NewProject {
   id: string;
   name: string;
+  /**
+   * Environments that exist on the newly-created project (typically just
+   * `production`). Returned inline so the caller doesn't need a second
+   * query — the tenant-deploy skill needs the production `environmentId`
+   * for every subsequent call.
+   */
+  environments: NewProjectEnvironment[];
 }
 
 export interface NewService {
@@ -759,13 +771,32 @@ export class RailwayClient {
         projectCreate(input: $input) {
           id
           name
+          environments {
+            edges {
+              node {
+                id
+                name
+              }
+            }
+          }
         }
       }
     `;
-    const data = await this.gql<{ projectCreate: NewProject }>(query, {
+    const data = await this.gql<{
+      projectCreate: {
+        id: string;
+        name: string;
+        environments: { edges: Array<{ node: NewProjectEnvironment }> };
+      };
+    }>(query, {
       input: { name, defaultEnvironmentName: 'production' },
     });
-    return data.projectCreate;
+    const p = data.projectCreate;
+    return {
+      id: p.id,
+      name: p.name,
+      environments: p.environments.edges.map((e) => e.node),
+    };
   }
 
   /**

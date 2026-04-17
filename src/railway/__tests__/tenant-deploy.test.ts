@@ -94,21 +94,34 @@ describe('listProjects', () => {
 describe('createProject', () => {
   beforeEach(() => vi.unstubAllGlobals());
 
-  it('returns {id, name} from projectCreate mutation', async () => {
-    vi.stubGlobal(
-      'fetch',
-      mockFetch([{ data: { projectCreate: { id: 'p-new', name: 'bolt-roth' } } }]),
-    );
-    expect(await newClient().createProject('bolt-roth')).toEqual({ id: 'p-new', name: 'bolt-roth' });
+  const projectCreateResponse = (id: string, name: string, envName = 'production') => ({
+    data: {
+      projectCreate: {
+        id,
+        name,
+        environments: {
+          edges: [{ node: { id: `env-${id}`, name: envName } }],
+        },
+      },
+    },
+  });
+
+  it('returns {id, name, environments[]} from projectCreate mutation', async () => {
+    vi.stubGlobal('fetch', mockFetch([projectCreateResponse('p-new', 'bolt-roth')]));
+    const result = await newClient().createProject('bolt-roth');
+    expect(result.id).toBe('p-new');
+    expect(result.name).toBe('bolt-roth');
+    expect(result.environments).toEqual([{ id: 'env-p-new', name: 'production' }]);
   });
 
   it('sends ProjectCreateInput with name + defaultEnvironmentName', async () => {
-    const fetchMock = mockFetch([{ data: { projectCreate: { id: 'p1', name: 'bolt-acme' } } }]);
+    const fetchMock = mockFetch([projectCreateResponse('p1', 'bolt-acme')]);
     vi.stubGlobal('fetch', fetchMock);
 
     await newClient().createProject('bolt-acme');
     const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
     expect(body.query).toContain('projectCreate');
+    expect(body.query).toContain('environments');
     expect(body.variables.input.name).toBe('bolt-acme');
     expect(body.variables.input.defaultEnvironmentName).toBe('production');
   });
@@ -116,6 +129,50 @@ describe('createProject', () => {
   it('throws when the Railway API returns an error', async () => {
     vi.stubGlobal('fetch', mockFetch([{ errors: [{ message: 'Name already taken' }] }]));
     await expect(newClient().createProject('bolt-heritage')).rejects.toThrow(/Name already taken/i);
+  });
+});
+
+describe('upsertVariables (bulk)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  it('returns {set, failed: []} when every variable succeeds', async () => {
+    // upsertVariables loops per variable — one mutation per entry
+    vi.stubGlobal(
+      'fetch',
+      mockFetch([
+        { data: { variableUpsert: true } },
+        { data: { variableUpsert: true } },
+        { data: { variableUpsert: true } },
+      ]),
+    );
+    const client = new RailwayClient({ token: 'test-token', projectId: 'p' });
+    const result = await client.upsertVariables('svc', 'env', {
+      JWT_SECRET: 'abc123',
+      BRAND_NAME: 'Roth',
+      BRAND_COLOR: '#1B2B4A',
+    });
+    expect(result).toEqual({ set: 3, failed: [] });
+  });
+
+  it('surfaces failed variable names so the skill can retry', async () => {
+    // First call succeeds, second returns errors array → upsertVariable throws →
+    // caught and pushed to failed[]
+    vi.stubGlobal(
+      'fetch',
+      mockFetch([
+        { data: { variableUpsert: true } },
+        { errors: [{ message: 'rate-limited' }] },
+        { data: { variableUpsert: true } },
+      ]),
+    );
+    const client = new RailwayClient({ token: 'test-token', projectId: 'p' });
+    const result = await client.upsertVariables('svc', 'env', {
+      ONE: 'v1',
+      TWO: 'v2',
+      THREE: 'v3',
+    });
+    expect(result.set).toBe(2);
+    expect(result.failed).toEqual(['TWO']);
   });
 });
 
