@@ -36,31 +36,17 @@ describe('listProjects', () => {
     vi.unstubAllGlobals();
   });
 
-  it('flattens projects across every workspace edge', async () => {
+  it('returns projects from the top-level projects query', async () => {
     vi.stubGlobal(
       'fetch',
       mockFetch([
         {
           data: {
-            me: {
-              workspaces: [
-                {
-                  id: 'ws-a',
-                  name: 'Personal',
-                  projects: {
-                    edges: [{ node: { id: 'p1', name: 'bolt-heritage', createdAt: '2026-04-01T00:00:00Z' } }],
-                  },
-                },
-                {
-                  id: 'ws-b',
-                  name: 'Studio B',
-                  projects: {
-                    edges: [
-                      { node: { id: 'p2', name: 'bolt-throwaway', createdAt: '2026-04-02T00:00:00Z' } },
-                      { node: { id: 'p3', name: 'quarterbook', createdAt: '2026-04-03T00:00:00Z' } },
-                    ],
-                  },
-                },
+            projects: {
+              edges: [
+                { node: { id: 'p1', name: 'bolt-heritage', createdAt: '2026-04-01T00:00:00Z' } },
+                { node: { id: 'p2', name: 'bolt-throwaway', createdAt: '2026-04-02T00:00:00Z' } },
+                { node: { id: 'p3', name: 'quarterbook', createdAt: '2026-04-03T00:00:00Z' } },
               ],
             },
           },
@@ -73,21 +59,22 @@ describe('listProjects', () => {
     expect(projects.map((p) => p.name)).toEqual(['bolt-heritage', 'bolt-throwaway', 'quarterbook']);
   });
 
-  it('returns an empty array when no workspaces exist', async () => {
-    vi.stubGlobal('fetch', mockFetch([{ data: { me: { workspaces: [] } } }]));
+  it('returns an empty array when no projects exist', async () => {
+    vi.stubGlobal('fetch', mockFetch([{ data: { projects: { edges: [] } } }]));
     expect(await newClient().listProjects()).toEqual([]);
   });
 
-  it('queries me.workspaces[].projects (non-deprecated path)', async () => {
-    const fetchMock = mockFetch([{ data: { me: { workspaces: [] } } }]);
+  it('uses the top-level projects query — NOT me.projects or me.workspaces', async () => {
+    const fetchMock = mockFetch([{ data: { projects: { edges: [] } } }]);
     vi.stubGlobal('fetch', fetchMock);
 
     await newClient().listProjects();
     const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
-    expect(body.query).toContain('workspaces');
-    expect(body.query).toContain('projects');
-    // Ensure we are NOT using the deprecated top-level me.projects shape
-    expect(body.query).not.toMatch(/me\s*\{\s*projects\s*\{/);
+    // Must use top-level `projects` — workspace API tokens have no `me` context
+    // and would fail with 401 on any query that starts with `me { ... }`.
+    expect(body.query).toMatch(/\{\s*projects\s*\{/);
+    expect(body.query).not.toMatch(/me\s*\{\s*projects/);
+    expect(body.query).not.toMatch(/me\s*\{\s*workspaces/);
   });
 });
 

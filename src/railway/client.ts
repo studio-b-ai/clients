@@ -721,43 +721,39 @@ export class RailwayClient {
   // ── Project-level (list / create / delete / service) ────
 
   /**
-   * List every Railway project the configured token can see. Flattens
-   * projects across every workspace the token is a member of.
+   * List every Railway project the configured token can see.
    *
-   * Schema note: `me.projects` is DEPRECATED and returns empty ("go
-   * through the workspace's projects"). Must query
-   * `me.workspaces[].projects.edges.node` and flatten client-side.
+   * Schema notes (introspected + live-tested 2026-04-17):
+   * - `me.projects` is DEPRECATED (Railway removed it; returns empty).
+   * - `me.workspaces[].projects` works for **personal/user tokens** but
+   *   fails with "Not Authorized" for **workspace API tokens** because
+   *   an API token has no `me` context (it's not a logged-in user).
+   * - The top-level `projects { edges { node } }` query works for both
+   *   personal tokens AND workspace API tokens — the token's implicit
+   *   scope determines which projects are returned.
+   *
+   * Use the top-level query so both token types work. Prior versions of
+   * this method used `me.workspaces[]` and failed under the production
+   * studiob-api service's workspace-scoped API token.
    */
   async listProjects(): Promise<ProjectSummary[]> {
     const query = `
       query {
-        me {
-          workspaces {
-            id
-            name
-            projects {
-              edges {
-                node {
-                  id
-                  name
-                  createdAt
-                }
-              }
+        projects {
+          edges {
+            node {
+              id
+              name
+              createdAt
             }
           }
         }
       }
     `;
     const data = await this.gql<{
-      me: { workspaces: Array<{ projects: { edges: Array<{ node: ProjectSummary }> } }> };
+      projects: { edges: Array<{ node: ProjectSummary }> };
     }>(query);
-    const out: ProjectSummary[] = [];
-    for (const ws of data.me.workspaces) {
-      for (const edge of ws.projects.edges) {
-        out.push(edge.node);
-      }
-    }
-    return out;
+    return data.projects.edges.map((e) => e.node);
   }
 
   /**
