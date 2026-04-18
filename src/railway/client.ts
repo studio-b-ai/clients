@@ -206,14 +206,6 @@ export class RailwayClient {
     this.projectId = config.projectId;
   }
 
-  /** Require projectId to be set — throws if constructor didn't receive one. */
-  private requireProjectId(): string {
-    if (!this.projectId) {
-      throw new Error('RailwayClient: projectId is required for this operation. Pass { projectId } in constructor.');
-    }
-    return this.projectId;
-  }
-
   private async gql<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
     const res = await fetch(RAILWAY_API, {
       method: 'POST',

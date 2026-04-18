@@ -12,12 +12,18 @@
  *   - getLatestDeployments pagination (first at query level, not in input)
  *   - DEPLOYMENT_TERMINAL_STATES / DEPLOYMENT_BLOCKED_STATES
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEPLOYMENT_BLOCKED_STATES,
   DEPLOYMENT_TERMINAL_STATES,
   RailwayClient,
 } from '../client.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CLIENT_SOURCE = readFileSync(resolve(__dirname, '../client.ts'), 'utf8');
 
 function mockFetch(responses: Array<Record<string, unknown>>) {
   let i = 0;
@@ -795,5 +801,46 @@ describe('getProjectUsage (projectId override)', () => {
     vi.stubGlobal('fetch', mockFetch([usageResponse]));
     const client = new RailwayClient({ token: 'test-token' });
     await expect(client.getProjectUsage()).rejects.toThrow(/projectId is required/i);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────
+// Guard against the `requireProjectId()` anti-pattern coming back.
+//
+// The helper made it trivial to write a method that silently used
+// the client's default projectId and ignored any override. PRs #27
+// and #32 replaced every call site with the
+// `projectId ?? this.projectId` pattern. If a future method needs
+// to scope by projectId it MUST accept it as an optional argument
+// and resolve via the override-or-default pattern, not resurrect
+// requireProjectId.
+//
+// This is a source-scan test rather than a behavioural one —
+// behavioural coverage only catches the methods we happen to test,
+// and the whole point of the anti-pattern is that missing coverage
+// for a new method looks identical to success.
+// ──────────────────────────────────────────────────────────────
+describe('requireProjectId anti-pattern guard', () => {
+  it('does not define or call requireProjectId anywhere in client.ts', () => {
+    expect(CLIENT_SOURCE).not.toContain('requireProjectId');
+  });
+
+  it('resolves projectId via the override-or-default pattern (projectId ?? this.projectId)', () => {
+    // Every method that consumes projectId should route through the
+    // `?? this.projectId` coalesce. If someone adds a new method that
+    // uses `this.projectId` directly without an override arg, the
+    // direct-use count rises while the coalesce count stays flat —
+    // the delta trips this assertion.
+    //
+    // Strip comments first so doc-comment references don't count.
+    const code = CLIENT_SOURCE
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/.*/g, '');
+    const directUses = code.match(/this\.projectId/g)?.length ?? 0;
+    const coalesceUses = code.match(/\?\?\s*this\.projectId/g)?.length ?? 0;
+    // The constructor assignment (`this.projectId = config.projectId`)
+    // is the only sanctioned non-coalesce use. Every other reference
+    // must be on the right-hand side of a `??`.
+    expect(directUses - coalesceUses).toBeLessThanOrEqual(1);
   });
 });
