@@ -41,7 +41,8 @@
     "zod": "^3.25.0"
   },
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
+    "access": "public",
+    "provenance": true
   },
   "devDependencies": {
     "@types/node": "^25.4.0",
