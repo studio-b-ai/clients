@@ -692,3 +692,108 @@ describe('restartService', () => {
     expect(body.query).toContain('serviceInstanceRedeploy');
   });
 });
+
+// ──────────────────────────────────────────────────────────────
+// projectId override on read-side project-scoped queries.
+//
+// Regression for bolt-deploy-tenant rehearsal 3 (2026-04-17): the
+// skill passed `project_id` to `railway_list_services` expecting it
+// to scope the query to the tenant project, but the MCP tool
+// silently forwarded to `client.listServices()` which uses the
+// constructor's default projectId. The caller got 24 services from
+// studiob-platform instead of the 2 services in the tenant project,
+// and the mismatch looked plausible because studiob-platform happens
+// to also have Postgres + Redis. Same pattern as PR #27 for the
+// write-side methods (upsert/delete/listDomains).
+// ──────────────────────────────────────────────────────────────
+
+describe('listServices (projectId override)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  const servicesResponse = { data: { project: { services: { edges: [] } } } };
+
+  it('uses the passed-in projectId, not the client default', async () => {
+    const fetchMock = mockFetch([servicesResponse]);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new RailwayClient({ token: 'test-token', projectId: 'studiob-platform' });
+    await client.listServices('bolt-throwaway');
+
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.variables.projectId).toBe('bolt-throwaway');
+    expect(body.variables.projectId).not.toBe('studiob-platform');
+  });
+
+  it('falls back to the client default when no projectId is passed', async () => {
+    const fetchMock = mockFetch([servicesResponse]);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new RailwayClient({ token: 'test-token', projectId: 'studiob-platform' });
+    await client.listServices();
+
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.variables.projectId).toBe('studiob-platform');
+  });
+
+  it('throws when neither the client nor the caller provides a projectId', async () => {
+    vi.stubGlobal('fetch', mockFetch([servicesResponse]));
+    const client = new RailwayClient({ token: 'test-token' });
+    await expect(client.listServices()).rejects.toThrow(/projectId is required/i);
+  });
+});
+
+describe('listEnvironments (projectId override)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  const environmentsResponse = { data: { project: { environments: { edges: [] } } } };
+
+  it('uses the passed-in projectId, not the client default', async () => {
+    const fetchMock = mockFetch([environmentsResponse]);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new RailwayClient({ token: 'test-token', projectId: 'studiob-platform' });
+    await client.listEnvironments('bolt-throwaway');
+
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.variables.projectId).toBe('bolt-throwaway');
+  });
+
+  it('throws when neither the client nor the caller provides a projectId', async () => {
+    vi.stubGlobal('fetch', mockFetch([environmentsResponse]));
+    const client = new RailwayClient({ token: 'test-token' });
+    await expect(client.listEnvironments()).rejects.toThrow(/projectId is required/i);
+  });
+});
+
+describe('getProjectUsage (projectId override)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  const usageResponse = {
+    data: {
+      project: {
+        estimatedCost: 12.34,
+        subscription: {
+          currentPeriodStart: '2026-04-01T00:00:00Z',
+          currentPeriodEnd: '2026-05-01T00:00:00Z',
+        },
+      },
+    },
+  };
+
+  it('uses the passed-in projectId, not the client default', async () => {
+    const fetchMock = mockFetch([usageResponse]);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new RailwayClient({ token: 'test-token', projectId: 'studiob-platform' });
+    await client.getProjectUsage('bolt-throwaway');
+
+    const body = JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.variables.projectId).toBe('bolt-throwaway');
+  });
+
+  it('throws when neither the client nor the caller provides a projectId', async () => {
+    vi.stubGlobal('fetch', mockFetch([usageResponse]));
+    const client = new RailwayClient({ token: 'test-token' });
+    await expect(client.getProjectUsage()).rejects.toThrow(/projectId is required/i);
+  });
+});

@@ -241,8 +241,24 @@ export class RailwayClient {
 
   // ── Services ─────────────────────────────────────────
 
-  async listServices(): Promise<ServiceSummary[]> {
-    const projectId = this.requireProjectId();
+  /**
+   * List services in a Railway project.
+   *
+   * **projectId resolution:** the optional `projectId` argument takes
+   * precedence over the client's constructor default. Without this
+   * override, tenant-deploy callers (bolt-deploy-tenant skill) that
+   * target a brand-new project would silently get the MCP client's
+   * default project's services instead — seen in rehearsal 3
+   * (2026-04-17) where a throwaway project appeared to have all 24
+   * studiob-platform services. If neither is set the call throws.
+   */
+  async listServices(projectId?: string): Promise<ServiceSummary[]> {
+    const effectiveProjectId = projectId ?? this.projectId;
+    if (!effectiveProjectId) {
+      throw new Error(
+        'RailwayClient.listServices: projectId is required — pass it or set it on the client.',
+      );
+    }
     const query = `
       query($projectId: String!) {
         project(id: $projectId) {
@@ -261,7 +277,7 @@ export class RailwayClient {
     `;
     const data = await this.gql<{
       project: { services: { edges: Array<{ node: ServiceSummary }> } };
-    }>(query, { projectId });
+    }>(query, { projectId: effectiveProjectId });
 
     return data.project.services.edges.map((e) => e.node);
   }
@@ -413,8 +429,20 @@ export class RailwayClient {
 
   // ── Environments ─────────────────────────────────────
 
-  async listEnvironments(): Promise<EnvironmentSummary[]> {
-    const projectId = this.requireProjectId();
+  /**
+   * List environments in a Railway project.
+   *
+   * **projectId resolution:** same rules as `listServices`. Optional
+   * `projectId` arg overrides the client default for tenant-deploy
+   * callers.
+   */
+  async listEnvironments(projectId?: string): Promise<EnvironmentSummary[]> {
+    const effectiveProjectId = projectId ?? this.projectId;
+    if (!effectiveProjectId) {
+      throw new Error(
+        'RailwayClient.listEnvironments: projectId is required — pass it or set it on the client.',
+      );
+    }
     const query = `
       query($projectId: String!) {
         project(id: $projectId) {
@@ -432,7 +460,7 @@ export class RailwayClient {
     `;
     const data = await this.gql<{
       project: { environments: { edges: Array<{ node: EnvironmentSummary }> } };
-    }>(query, { projectId });
+    }>(query, { projectId: effectiveProjectId });
 
     return data.project.environments.edges.map((e) => e.node);
   }
@@ -790,9 +818,18 @@ export class RailwayClient {
 
   /**
    * Get estimated cost for current billing period.
+   *
+   * **projectId resolution:** same rules as `listServices`. Optional
+   * `projectId` arg overrides the client default for tenant-deploy
+   * callers.
    */
-  async getProjectUsage(): Promise<ProjectUsage> {
-    const projectId = this.requireProjectId();
+  async getProjectUsage(projectId?: string): Promise<ProjectUsage> {
+    const effectiveProjectId = projectId ?? this.projectId;
+    if (!effectiveProjectId) {
+      throw new Error(
+        'RailwayClient.getProjectUsage: projectId is required — pass it or set it on the client.',
+      );
+    }
     const query = `
       query($projectId: String!) {
         project(id: $projectId) {
@@ -810,7 +847,7 @@ export class RailwayClient {
         estimatedCost: number;
         subscription: { currentPeriodStart: string; currentPeriodEnd: string };
       };
-    }>(query, { projectId });
+    }>(query, { projectId: effectiveProjectId });
 
     return {
       estimatedCost: data.project.estimatedCost,
