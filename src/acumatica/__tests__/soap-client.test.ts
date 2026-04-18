@@ -278,14 +278,18 @@ describe('SoapClient', () => {
   // -- allocateLot() ------------------------------------------------------
 
   describe('allocateLot()', () => {
-    it('executes correct command sequence for single lot', async () => {
+    it('executes correct two-submit sequence for single lot', async () => {
       // Login
       mockRequest.mockResolvedValueOnce(
         mockResponse(200, LOGIN_SUCCESS_BODY, {
           'set-cookie': '.ASPXAUTH=abc123; path=/',
         }),
       );
-      // Submit
+      // Submit #1 (navigate)
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, SUBMIT_SUCCESS_BODY),
+      );
+      // Submit #2 (set lot + save)
       mockRequest.mockResolvedValueOnce(
         mockResponse(200, SUBMIT_SUCCESS_BODY),
       );
@@ -305,26 +309,33 @@ describe('SoapClient', () => {
       expect(result.message).toContain('000952271');
       expect(result.message).toContain('S006083');
 
-      // Verify 3 calls: login, submit, logout
-      expect(mockRequest).toHaveBeenCalledTimes(3);
+      // Verify 4 calls: login, navigate submit, set-lot submit, logout.
+      // Split is load-bearing (soap-client.ts:386-390) — single-submit Save
+      // fires before navigation completes and Acumatica inserts new records
+      // on a blank form.
+      expect(mockRequest).toHaveBeenCalledTimes(4);
 
-      // Verify submit body has all commands in correct order
-      const submitBody = mockRequest.mock.calls[1]![1].body as string;
-      expect(submitBody).toContain('<Value>SO</Value>');
-      expect(submitBody).toContain('<Value>S006083</Value>');
-      expect(submitBody).toContain('<Value>1</Value>');
-      expect(submitBody).toContain('<Value>000952271</Value>');
-      // Save command should be last
-      expect(submitBody).toContain('<FieldName>Save</FieldName>');
+      // mock.calls[1] = navigate submit: OrderType + OrderNbr only
+      const navigateBody = mockRequest.mock.calls[1]![1].body as string;
+      expect(navigateBody).toContain('<FieldName>OrderType</FieldName>');
+      expect(navigateBody).toContain('<Value>SO</Value>');
+      expect(navigateBody).toContain('<FieldName>OrderNbr</FieldName>');
+      expect(navigateBody).toContain('<Value>S006083</Value>');
+      expect(navigateBody).not.toContain('LineNbr');
+      expect(navigateBody).not.toContain('LotSerialNbr');
+      expect(navigateBody).not.toContain('<FieldName>Save</FieldName>');
 
-      // Verify order of commands: OrderType before OrderNbr before LineNbr before LotSerialNbr before Save
-      const orderTypeIdx = submitBody.indexOf('OrderType');
-      const orderNbrIdx = submitBody.indexOf('OrderNbr');
-      const lineNbrIdx = submitBody.indexOf('LineNbr');
-      const lotIdx = submitBody.indexOf('LotSerialNbr');
-      const saveIdx = submitBody.indexOf('Save');
-      expect(orderTypeIdx).toBeLessThan(orderNbrIdx);
-      expect(orderNbrIdx).toBeLessThan(lineNbrIdx);
+      // mock.calls[2] = set-lot submit: LineNbr + LotSerialNbr + Save, in order
+      const setLotBody = mockRequest.mock.calls[2]![1].body as string;
+      expect(setLotBody).toContain('<FieldName>LineNbr</FieldName>');
+      expect(setLotBody).toContain('<Value>1</Value>');
+      expect(setLotBody).toContain('<FieldName>LotSerialNbr</FieldName>');
+      expect(setLotBody).toContain('<Value>000952271</Value>');
+      expect(setLotBody).toContain('<FieldName>Save</FieldName>');
+
+      const lineNbrIdx = setLotBody.indexOf('LineNbr');
+      const lotIdx = setLotBody.indexOf('LotSerialNbr');
+      const saveIdx = setLotBody.indexOf('Save');
       expect(lineNbrIdx).toBeLessThan(lotIdx);
       expect(lotIdx).toBeLessThan(saveIdx);
     });
@@ -388,14 +399,23 @@ describe('SoapClient', () => {
       expect(mockRequest).not.toHaveBeenCalled();
     });
 
-    it('includes quantity in commands when specified', async () => {
+    it('does not send Quantity alongside LotSerialNbr (Acumatica re-splits lot assignment)', async () => {
+      // Guards the invariant documented at soap-client.ts:357-360: passing
+      // Quantity in the same Submit as LotSerialNbr causes Acumatica to
+      // re-evaluate the split, discarding the lot assignment. allocateLot
+      // accepts lots[].quantity for forward-compat with multi-lot (see TODO
+      // at soap-client.ts:363) but must NOT forward it on single-lot.
       // Login
       mockRequest.mockResolvedValueOnce(
         mockResponse(200, LOGIN_SUCCESS_BODY, {
           'set-cookie': '.ASPXAUTH=abc123; path=/',
         }),
       );
-      // Submit
+      // Submit (navigate)
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, SUBMIT_SUCCESS_BODY),
+      );
+      // Submit (set lot + save)
       mockRequest.mockResolvedValueOnce(
         mockResponse(200, SUBMIT_SUCCESS_BODY),
       );
@@ -411,9 +431,14 @@ describe('SoapClient', () => {
         lots: [{ lotSerialNbr: '000952271', quantity: 50 }],
       });
 
-      const submitBody = mockRequest.mock.calls[1]![1].body as string;
-      expect(submitBody).toContain('<FieldName>Quantity</FieldName>');
-      expect(submitBody).toContain('<Value>50</Value>');
+      // mock.calls[0] = login, [1] = navigate submit, [2] = set-lot submit, [3] = logout
+      const navigateBody = mockRequest.mock.calls[1]![1].body as string;
+      const setLotBody = mockRequest.mock.calls[2]![1].body as string;
+      expect(navigateBody).not.toContain('Quantity');
+      expect(navigateBody).not.toContain('<Value>50</Value>');
+      expect(setLotBody).toContain('<FieldName>LotSerialNbr</FieldName>');
+      expect(setLotBody).not.toContain('<FieldName>Quantity</FieldName>');
+      expect(setLotBody).not.toContain('<Value>50</Value>');
     });
 
     it('always calls logout even on submit failure', async () => {
