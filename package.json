@@ -2,6 +2,15 @@
   "name": "@studio-b-ai/clients",
   "version": "0.2.0",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/studio-b-ai/clients.git"
+  },
+  "homepage": "https://github.com/studio-b-ai/clients#readme",
+  "bugs": {
+    "url": "https://github.com/studio-b-ai/clients/issues"
+  },
+  "license": "MIT",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
