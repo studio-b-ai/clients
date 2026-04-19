@@ -1,0 +1,4 @@
+{
+  "packages": { ".": { "release-type": "node", "package-name": "@studio-b-ai/clients" } },
+  "pull-request-title-pattern": "chore: release ${version}"
+}
