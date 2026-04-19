@@ -1,16 +1,23 @@
 /**
- * Per-account Acumatica session pool with Redis-backed cookie reuse.
+ * Per-(baseUrl, account, company) Acumatica session pool with Redis-backed
+ * cookie reuse.
  *
  * Replaces the pattern of login→work→logout on every request with
  * checkout→work→checkin, reusing session cookies across requests.
- * Each account gets its own pool with configurable max slots.
+ * Each (baseUrl, account, company) tuple gets its own pool with configurable
+ * max slots — tenants on the same Acumatica instance, or the same account
+ * name across instances, do NOT share lockout state or session slots.
  *
- * Redis data model:
- *   acumatica:pool:{account}:meta    — hash (maxSize, activeLogins)
- *   acumatica:pool:{account}:slots   — set of active slot IDs
- *   acumatica:pool:{account}:slot:{id} — hash (cookie, timestamps, checkout state)
- *   acumatica:lockout:{account}      — string with TTL (circuit breaker lockout)
- *   acumatica:pool:{account}:login-failures — string with TTL (failure counter)
+ * Redis data model (PREFIX = `acumatica:pool:{b64(baseUrl)}:{account}:{b64(company)}`):
+ *   {PREFIX}:meta    — hash (maxSize, activeLogins)
+ *   {PREFIX}:slots   — set of active slot IDs
+ *   {PREFIX}:slot:{id} — hash (cookie, timestamps, checkout state)
+ *   {PREFIX}:login-failures — string with TTL (failure counter)
+ *   acumatica:lockout:{b64(baseUrl)}:{account}:{b64(company)} — string with TTL
+ *
+ * Note: pre-2026-04-19 keys (account-only scope) are abandoned on upgrade.
+ * They will expire naturally via the AcumaticaClient session TTL or can be
+ * flushed manually with `redis-cli --scan --pattern 'acumatica:pool:*'`.
  */
 
 import { randomUUID } from 'crypto';
@@ -99,44 +106,71 @@ export class SessionPoolExhaustedError extends Error {
 }
 
 // -- Redis key helpers --
+//
+// Keys are scoped by (baseUrl, account, company) so tenants on the same
+// Acumatica instance, or the same `account` name across instances, do NOT
+// share session slots or lockout state. baseUrl + company are base64url
+// encoded so colons in URLs survive the key parser.
 
-function metaKey(account: string): string {
-  return `acumatica:pool:${account}:meta`;
+function b64u(s: string): string {
+  return Buffer.from(s, 'utf8').toString('base64url');
 }
 
-function slotsKey(account: string): string {
-  return `acumatica:pool:${account}:slots`;
+/**
+ * Build the per-tuple key prefix. Exposed for tests.
+ * Empty `company` is normalised to `_` so it stays distinguishable from a
+ * caller who passes the literal string `_`.
+ */
+export function poolKeyPrefix(
+  baseUrl: string,
+  account: string,
+  company: string | undefined,
+): string {
+  return `acumatica:pool:${b64u(baseUrl)}:${account}:${b64u(company || '_')}`;
 }
 
-function slotKey(account: string, slotId: string): string {
-  return `acumatica:pool:${account}:slot:${slotId}`;
+/** Mirror of `poolKeyPrefix` for the per-tuple lockout key. */
+export function poolLockoutKey(
+  baseUrl: string,
+  account: string,
+  company: string | undefined,
+): string {
+  return `acumatica:lockout:${b64u(baseUrl)}:${account}:${b64u(company || '_')}`;
 }
 
-function lockoutKey(account: string): string {
-  return `acumatica:lockout:${account}`;
+function metaKey(prefix: string): string {
+  return `${prefix}:meta`;
 }
 
-function loginFailuresKey(account: string): string {
-  return `acumatica:pool:${account}:login-failures`;
+function slotsKey(prefix: string): string {
+  return `${prefix}:slots`;
+}
+
+function slotKey(prefix: string, slotId: string): string {
+  return `${prefix}:slot:${slotId}`;
+}
+
+function loginFailuresKey(prefix: string): string {
+  return `${prefix}:login-failures`;
 }
 
 // -- Lua scripts --
 
 /**
  * CHECKOUT_LUA: Find an available slot (checkedOutBy == "") or reclaim a stale one.
- * KEYS[1] = slotsKey, ARGV[1] = account, ARGV[2] = serviceId, ARGV[3] = now, ARGV[4] = staleMs
+ * KEYS[1] = slotsKey, ARGV[1] = keyPrefix, ARGV[2] = serviceId, ARGV[3] = now, ARGV[4] = staleMs
  * Returns: [slotId, cookie] or [nil] if none available.
  */
 const CHECKOUT_LUA = `
   local slotsKey = KEYS[1]
-  local account = ARGV[1]
+  local keyPrefix = ARGV[1]
   local serviceId = ARGV[2]
   local now = tonumber(ARGV[3])
   local staleMs = tonumber(ARGV[4])
 
   local slotIds = redis.call('SMEMBERS', slotsKey)
   for _, sid in ipairs(slotIds) do
-    local sk = 'acumatica:pool:' .. account .. ':slot:' .. sid
+    local sk = keyPrefix .. ':slot:' .. sid
     local checkedOutBy = redis.call('HGET', sk, 'checkedOutBy')
     if checkedOutBy == '' or checkedOutBy == false then
       -- Available slot: check it out
@@ -216,6 +250,10 @@ export class SessionPool {
   private redis: Redis | null = null;
   private degraded = false;
   private log: Logger;
+  /** Per-(baseUrl, account, company) Redis key prefix. */
+  readonly keyPrefix: string;
+  /** Per-(baseUrl, account, company) lockout key. */
+  readonly lockoutKey: string;
   readonly circuitBreaker: AcumaticaCircuitBreaker;
 
   /** In-memory slot store for degraded mode (no Redis) */
@@ -241,6 +279,16 @@ export class SessionPool {
     this.pollIntervalMs = config.pollIntervalMs ?? 2_000;
     this.keepaliveMs = config.keepaliveMs ?? 600_000;
     this.log = config.logger ?? pino({ name: `session-pool:${config.account}` });
+    this.keyPrefix = poolKeyPrefix(
+      config.credentials.baseUrl,
+      config.account,
+      config.credentials.tenant,
+    );
+    this.lockoutKey = poolLockoutKey(
+      config.credentials.baseUrl,
+      config.account,
+      config.credentials.tenant,
+    );
     this.circuitBreaker = new AcumaticaCircuitBreaker();
     this.onEvent = config.onEvent;
   }
@@ -300,9 +348,9 @@ export class SessionPool {
     const redis = this.getRedis();
     if (!redis || this.degraded) return;
 
-    const slotIds = await redis.smembers(slotsKey(this.account));
+    const slotIds = await redis.smembers(slotsKey(this.keyPrefix));
     for (const sid of slotIds) {
-      const slotData = await redis.hgetall(slotKey(this.account, sid));
+      const slotData = await redis.hgetall(slotKey(this.keyPrefix, sid));
       if (!slotData || slotData.checkedOutBy !== '') continue;
       try {
         await this.pingSession(slotData.cookie);
@@ -429,7 +477,7 @@ export class SessionPool {
     }
 
     // Check lockout
-    const locked = await redis.get(lockoutKey(this.account)).catch(() => null);
+    const locked = await redis.get(this.lockoutKey).catch(() => null);
     if (locked) {
       throw new AccountLockedError(
         `Account "${this.account}" is locked out (Redis guard).`,
@@ -440,8 +488,8 @@ export class SessionPool {
     const result = await redis.eval(
       CHECKOUT_LUA,
       1,
-      slotsKey(this.account),
-      this.account,
+      slotsKey(this.keyPrefix),
+      this.keyPrefix,
       this.serviceId,
       String(Date.now()),
       String(this.staleCheckoutMs),
@@ -459,7 +507,7 @@ export class SessionPool {
     }
 
     // No available slot — check if under capacity
-    const activeCount = await redis.scard(slotsKey(this.account));
+    const activeCount = await redis.scard(slotsKey(this.keyPrefix));
     if (activeCount < this.maxSize) {
       // Login and create a new slot
       const cookie = await this.loginToAcumatica();
@@ -469,8 +517,8 @@ export class SessionPool {
       await redis.eval(
         CREATE_SLOT_LUA,
         2,
-        slotsKey(this.account),
-        slotKey(this.account, newSlotId),
+        slotsKey(this.keyPrefix),
+        slotKey(this.keyPrefix, newSlotId),
         newSlotId,
         cookie,
         this.serviceId,
@@ -505,8 +553,8 @@ export class SessionPool {
       const result = await redis.eval(
         CHECKOUT_LUA,
         1,
-        slotsKey(this.account),
-        this.account,
+        slotsKey(this.keyPrefix),
+        this.keyPrefix,
         this.serviceId,
         String(Date.now()),
         String(this.staleCheckoutMs),
@@ -543,7 +591,7 @@ export class SessionPool {
     await redis.eval(
       CHECKIN_LUA,
       1,
-      slotKey(this.account, handle.slotId),
+      slotKey(this.keyPrefix, handle.slotId),
       String(Date.now()),
     );
     this.log.debug({ slotId: handle.slotId }, 'Checked in slot');
@@ -606,8 +654,8 @@ export class SessionPool {
     await redis.eval(
       EVICT_SLOT_LUA,
       2,
-      slotsKey(this.account),
-      slotKey(this.account, slotId),
+      slotsKey(this.keyPrefix),
+      slotKey(this.keyPrefix, slotId),
       slotId,
     );
     this.log.debug({ slotId }, 'Evicted pool slot');
@@ -622,7 +670,7 @@ export class SessionPool {
       return;
     }
 
-    const slotIds = await redis.smembers(slotsKey(this.account));
+    const slotIds = await redis.smembers(slotsKey(this.keyPrefix));
     for (const sid of slotIds) {
       await this.evictSlot(sid, false);
     }
@@ -645,9 +693,9 @@ export class SessionPool {
       let checkedOut = 0;
       const slots: PoolStatus['slots'] = [];
 
-      const slotIds = await redis.smembers(slotsKey(this.account));
+      const slotIds = await redis.smembers(slotsKey(this.keyPrefix));
       for (const sid of slotIds) {
-        const slotData = await redis.hgetall(slotKey(this.account, sid));
+        const slotData = await redis.hgetall(slotKey(this.keyPrefix, sid));
         if (!slotData || !slotData.createdAt) continue;
         activeSlots++;
         const isCheckedOut = slotData.checkedOutBy !== '';

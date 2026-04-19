@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SessionPool, type SessionHandle } from '../session-pool.js';
+import {
+  SessionPool,
+  poolKeyPrefix,
+  poolLockoutKey,
+  type SessionHandle,
+} from '../session-pool.js';
 import { AccountLockedError } from '../error-handler.js';
 
 function makePool(overrides: Partial<ConstructorParameters<typeof SessionPool>[0]> = {}) {
@@ -19,6 +24,54 @@ function makePool(overrides: Partial<ConstructorParameters<typeof SessionPool>[0
 }
 
 describe('SessionPool', () => {
+  describe('per-(baseUrl, account, company) key scoping', () => {
+    it('produces a different prefix for different company on the same instance', () => {
+      const a = poolKeyPrefix('https://hf.acumatica.com', 'api-bot', 'Heritage Fabrics');
+      const b = poolKeyPrefix('https://hf.acumatica.com', 'api-bot', 'Heritage Test');
+      expect(a).not.toBe(b);
+      expect(a).toMatch(/^acumatica:pool:[A-Za-z0-9_-]+:api-bot:[A-Za-z0-9_-]+$/);
+    });
+
+    it('produces a different prefix for different baseUrl with the same account+company', () => {
+      const a = poolKeyPrefix('https://hf.acumatica.com', 'api-bot', 'Heritage Fabrics');
+      const b = poolKeyPrefix('https://other.acumatica.com', 'api-bot', 'Heritage Fabrics');
+      expect(a).not.toBe(b);
+    });
+
+    it('produces a different lockout key for different company on the same instance', () => {
+      const a = poolLockoutKey('https://hf.acumatica.com', 'api-bot', 'Heritage Fabrics');
+      const b = poolLockoutKey('https://hf.acumatica.com', 'api-bot', 'Heritage Test');
+      expect(a).not.toBe(b);
+    });
+
+    it('two pools sharing only the account name DO NOT share lockout state', () => {
+      const hf = makePool({
+        credentials: {
+          baseUrl: 'https://hf.acumatica.com',
+          username: 'api-bot',
+          password: 'secret',
+          tenant: 'Heritage Fabrics',
+        },
+      });
+      const hfTest = makePool({
+        credentials: {
+          baseUrl: 'https://hf.acumatica.com',
+          username: 'api-bot',
+          password: 'secret',
+          tenant: 'Heritage Test',
+        },
+      });
+      expect(hf.lockoutKey).not.toBe(hfTest.lockoutKey);
+      expect(hf.keyPrefix).not.toBe(hfTest.keyPrefix);
+    });
+
+    it('treats undefined company the same on every call (idempotent)', () => {
+      const a = poolKeyPrefix('https://x.acumatica.com', 'api-bot', undefined);
+      const b = poolKeyPrefix('https://x.acumatica.com', 'api-bot', undefined);
+      expect(a).toBe(b);
+    });
+  });
+
   describe('types and construction', () => {
     it('should construct with required config', () => {
       const pool = makePool({ redisUrl: 'redis://localhost:6379' });
