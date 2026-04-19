@@ -8,23 +8,16 @@ on:
       - 'package.json'
   workflow_dispatch:
 
+# Tests run in ci.yml on every push to main; this workflow only handles
+# the npm publish step (gated separately so a publish failure doesn't
+# masquerade as a test failure, and so PRs aren't blocked on a workflow
+# that by definition can't run pre-merge).
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write   # enables npm --provenance via OIDC
-
-    services:
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
 
     steps:
       - uses: actions/checkout@v4
@@ -40,16 +33,7 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Unit tests
-        run: npm test
-
-      - name: Integration tests (pre-existing flaky, non-blocking)
-        continue-on-error: true
-        run: npm run test:integration
-        env:
-          REDIS_URL: redis://localhost:6379
-
       - name: Publish with provenance
-        run: npm publish --provenance
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
