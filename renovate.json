@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:base"],
+  "schedule": ["before 9am on monday"],
+  "dependencyDashboard": true,
+  "labels": ["dependencies"],
+  "automerge": false,
+  "packageRules": [
+    { "matchPackagePatterns": ["^@types/"], "groupName": "types packages" },
+    { "matchPackagePatterns": ["^eslint"], "groupName": "eslint packages" },
+    { "matchUpdateTypes": ["major"], "dependencyDashboardApproval": true }
+  ]
+}
