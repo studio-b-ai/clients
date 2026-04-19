@@ -21,6 +21,7 @@ import type { AcumaticaConfig } from '../shared/config.js';
 import { wrap, unwrap } from './value-wrapper.js';
 import { matchError, genericError, AccountLockedError, type AcumaticaError } from './error-handler.js';
 import { AcumaticaCircuitBreaker, CircuitOpenError } from './circuit-breaker.js';
+import { poolLockoutKey, poolKeyPrefix } from './session-pool.js';
 
 // -- Call Counter --
 
@@ -98,8 +99,12 @@ export interface AcumaticaClientOptions {
   /**
    * Optional Redis instance for lockout guard coordination.
    * When provided, the client will:
-   * - Check `acumatica:lockout` before login (skip if locked)
-   * - Set `acumatica:lockout` on AccountLockedError (pause all services)
+   * - Check both `acumatica:lockout` (legacy global) AND the per-tenant
+   *   scoped key (`poolLockoutKey(baseUrl, username, tenant)`) before login
+   *   — either one trips the guard.
+   * - Set both keys on AccountLockedError (back-compat dual-write; legacy
+   *   global remains for webhook-router/lockout-guard.ts until it migrates
+   *   to per-tenant guards).
    * If not provided, lockout guard is disabled (standalone mode).
    */
   redis?: { get(key: string): Promise<string | null>; set(key: string, value: string, ...args: unknown[]): Promise<unknown>; };
@@ -109,10 +114,16 @@ export interface AcumaticaClientOptions {
 
 const LOGIN_RETRY_DELAYS = [10_000, 30_000, 60_000];
 
-// Lockout guard constants (shared with webhook-router lockout-guard.ts)
-const LOCKOUT_KEY = 'acumatica:lockout';
+// Legacy global lockout keys. Kept as an alias during the single-tenant
+// transition so existing consumers (webhook-router/src/lib/lockout-guard.ts,
+// studiob packages/api/src/routes/maintenance.ts) continue to function.
+// AcumaticaClient dual-writes to both the legacy global key AND a scoped
+// per-(baseUrl, username, tenant) key, and reads "locked" if EITHER is set.
+// When a second tenant goes live the global write is dropped and consumers
+// migrate to per-tenant guards.
+const LEGACY_GLOBAL_LOCKOUT_KEY = 'acumatica:lockout';
+const LEGACY_GLOBAL_LOGIN_FAILURES_KEY = 'acumatica:login-failures';
 const LOCKOUT_TTL_SECONDS = 600; // 10 minutes
-const LOGIN_FAILURES_KEY = 'acumatica:login-failures';
 const LOGIN_BUDGET_TTL_SECONDS = 1800; // 30-min sliding window
 const LOGIN_BUDGET_MAX = 5; // was: 1 — single transient error shouldn't brick env
 
@@ -132,6 +143,10 @@ export class AcumaticaClient {
   readonly callCounter: CallCounter;
   private log: Logger;
   private redis?: AcumaticaClientOptions['redis'];
+  /** Per-(baseUrl, username, tenant) Redis key for AccountLocked flag. */
+  readonly lockoutKey: string;
+  /** Per-(baseUrl, username, tenant) Redis key for the login-failure budget counter. */
+  readonly loginFailuresKey: string;
 
   /** Optional circuit breaker — trips on lockout, blocks all requests until cooldown. */
   circuitBreaker?: AcumaticaCircuitBreaker;
@@ -150,9 +165,48 @@ export class AcumaticaClient {
     this.log = opts.logger ?? pino({ name: 'acumatica-client' });
     this.callCounter = new CallCounter(opts.budget);
     this.redis = opts.redis;
+    this.lockoutKey = poolLockoutKey(this.baseUrl, this.username, this.tenant);
+    this.loginFailuresKey = `${poolKeyPrefix(this.baseUrl, this.username, this.tenant)}:login-failures`;
     this.agent = new Agent({
       connect: { timeout: opts.requestTimeoutMs ?? 60_000 },
     });
+  }
+
+  // -- Test hooks (non-production) --
+  /** @internal test-only */
+  setRedisForTesting(redis: AcumaticaClientOptions['redis']): void {
+    this.redis = redis;
+  }
+  /** @internal test-only — wraps the internal lockout read path. */
+  async isLockedForTesting(): Promise<boolean> {
+    return this.checkLockout();
+  }
+  /** @internal test-only — wraps the internal lockout write path. */
+  async setLockoutForTesting(reason: string): Promise<void> {
+    await this.writeLockout(reason);
+  }
+
+  // -- Lockout read/write (dual: legacy global + per-tenant scoped) --
+
+  private async checkLockout(): Promise<boolean> {
+    if (!this.redis) return false;
+    const [legacy, scoped] = await Promise.all([
+      this.redis.get(LEGACY_GLOBAL_LOCKOUT_KEY).catch(() => null),
+      this.redis.get(this.lockoutKey).catch(() => null),
+    ]);
+    return Boolean(legacy || scoped);
+  }
+
+  private async writeLockout(value: string): Promise<void> {
+    if (!this.redis) return;
+    await Promise.all([
+      this.redis.set(LEGACY_GLOBAL_LOCKOUT_KEY, value, 'EX', LOCKOUT_TTL_SECONDS).catch(
+        (e) => this.log.warn({ err: (e as Error).message }, 'Failed to set legacy global lockout flag'),
+      ),
+      this.redis.set(this.lockoutKey, value, 'EX', LOCKOUT_TTL_SECONDS).catch(
+        (e) => this.log.warn({ err: (e as Error).message, key: this.lockoutKey }, 'Failed to set scoped lockout flag'),
+      ),
+    ]);
   }
 
   // -- HTTP helpers --
@@ -198,14 +252,12 @@ export class AcumaticaClient {
       );
     }
 
-    // Check Redis lockout guard before attempting login
-    if (this.redis) {
-      const locked = await this.redis.get(LOCKOUT_KEY).catch(() => null);
-      if (locked) {
-        throw new AccountLockedError(
-          'Acumatica account locked out (Redis guard). Unlock in SM201010 or wait for TTL expiry.',
-        );
-      }
+    // Check Redis lockout guard before attempting login. Reads either the
+    // legacy global key or the per-tenant scoped key — either one trips.
+    if (this.redis && (await this.checkLockout())) {
+      throw new AccountLockedError(
+        'Acumatica account locked out (Redis guard). Unlock in SM201010 or wait for TTL expiry.',
+      );
     }
 
     // Proactive refresh near expiry
@@ -264,15 +316,9 @@ export class AcumaticaClient {
             this.log.error(
               'Acumatica account is LOCKED OUT — stopping all login attempts',
             );
-            // Set Redis lockout flag so all services stop attempting login
-            if (this.redis) {
-              await this.redis.set(
-                LOCKOUT_KEY,
-                new Date().toISOString(),
-                'EX',
-                LOCKOUT_TTL_SECONDS,
-              ).catch((e) => this.log.warn({ err: (e as Error).message }, 'Failed to set Redis lockout flag'));
-            }
+            // Set Redis lockout flag so all services stop attempting login.
+            // Dual-writes legacy global + per-tenant scoped keys.
+            await this.writeLockout(new Date().toISOString());
             throw new AccountLockedError(
               'Acumatica account locked out. Unlock in SM201010 (Users screen).',
             );
@@ -361,14 +407,20 @@ export class AcumaticaClient {
   private async checkLoginBudget(): Promise<void> {
     if (!this.redis) return;
     try {
-      const count = await this.redis.get(LOGIN_FAILURES_KEY);
-      if (count && parseInt(count, 10) > LOGIN_BUDGET_MAX) {
-        await this.redis.set(
-          LOCKOUT_KEY,
+      // Check both the per-tenant counter and the legacy global counter —
+      // whichever is higher wins during the transition window.
+      const [scopedCount, legacyCount] = await Promise.all([
+        this.redis.get(this.loginFailuresKey).catch(() => null),
+        this.redis.get(LEGACY_GLOBAL_LOGIN_FAILURES_KEY).catch(() => null),
+      ]);
+      const count = Math.max(
+        scopedCount ? parseInt(scopedCount, 10) : 0,
+        legacyCount ? parseInt(legacyCount, 10) : 0,
+      );
+      if (count > LOGIN_BUDGET_MAX) {
+        await this.writeLockout(
           `${new Date().toISOString()} | Login budget exhausted (${count} failures in 30min)`,
-          'EX',
-          LOCKOUT_TTL_SECONDS,
-        ).catch(() => {});
+        );
         throw new AccountLockedError(
           `Login attempt budget exhausted — ${count} failures in 30-min window. Guard tripped preemptively.`,
         );
@@ -386,10 +438,20 @@ export class AcumaticaClient {
   private async recordLoginFailure(): Promise<void> {
     if (!this.redis) return;
     try {
-      const current = await this.redis.get(LOGIN_FAILURES_KEY);
-      const next = current ? parseInt(current, 10) + 1 : 1;
-      await this.redis.set(LOGIN_FAILURES_KEY, String(next), 'EX', LOGIN_BUDGET_TTL_SECONDS);
-      this.log.warn({ failures: next, budget: LOGIN_BUDGET_MAX }, 'Login failure recorded');
+      // Increment both counters in parallel. Legacy global counter is kept in
+      // sync so webhook-router and maintenance.ts can still observe failure
+      // rates without knowing about the scoped key yet.
+      const [scopedCur, legacyCur] = await Promise.all([
+        this.redis.get(this.loginFailuresKey).catch(() => null),
+        this.redis.get(LEGACY_GLOBAL_LOGIN_FAILURES_KEY).catch(() => null),
+      ]);
+      const scopedNext = scopedCur ? parseInt(scopedCur, 10) + 1 : 1;
+      const legacyNext = legacyCur ? parseInt(legacyCur, 10) + 1 : 1;
+      await Promise.all([
+        this.redis.set(this.loginFailuresKey, String(scopedNext), 'EX', LOGIN_BUDGET_TTL_SECONDS),
+        this.redis.set(LEGACY_GLOBAL_LOGIN_FAILURES_KEY, String(legacyNext), 'EX', LOGIN_BUDGET_TTL_SECONDS),
+      ]);
+      this.log.warn({ failures: scopedNext, budget: LOGIN_BUDGET_MAX, scopedKey: this.loginFailuresKey }, 'Login failure recorded');
     } catch (err) {
       this.log.warn({ err: (err as Error).message }, 'Failed to record login failure (non-fatal)');
     }
