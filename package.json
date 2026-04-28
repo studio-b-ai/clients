@@ -28,7 +28,8 @@
     "./shared/encryption": "./dist/shared/encryption.js",
     "./acumatica/recipes": "./dist/acumatica/recipes.js",
     "./hubspot/recipes": "./dist/hubspot/recipes.js",
-    "./zoom/recipes": "./dist/zoom/recipes.js"
+    "./zoom/recipes": "./dist/zoom/recipes.js",
+    "./outcome-envelope": "./dist/outcome-envelope/index.js"
   },
   "files": [
     "dist",

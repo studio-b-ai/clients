@@ -16,6 +16,7 @@ export default defineConfig({
     'acumatica/recipes': 'src/acumatica/recipes.ts',
     'hubspot/recipes': 'src/hubspot/recipes.ts',
     'zoom/recipes': 'src/zoom/recipes.ts',
+    'outcome-envelope/index': 'src/outcome-envelope/index.ts',
   },
   format: ['esm'],
   dts: true,
