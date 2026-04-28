@@ -58,3 +58,6 @@ export type { LinkedInClientConfig, LinkedInAuthConfig, LinkedInTokenResponse } 
 export * from './shared/errors.js';
 export * from './shared/config.js';
 export * from './shared/encryption.js';
+
+// Outcome Envelope
+export * from './outcome-envelope/index.js';
