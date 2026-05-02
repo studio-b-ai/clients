@@ -5,6 +5,15 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0](https://github.com/studio-b-ai/clients/compare/v1.0.0...v1.1.0) (2026-05-02)
+
+
+### Features
+
+* @studio-b-ai/outcome-envelope v1.0.0 ([93bc83f](https://github.com/studio-b-ai/clients/commit/93bc83f27e2ec50234d230192a81d6bc19da41d0))
+* **acumatica:** add initialCookies support for pool-managed clients (v1.1.0) ([#11](https://github.com/studio-b-ai/clients/issues/11)) ([70c6038](https://github.com/studio-b-ai/clients/commit/70c60380bf14b171d1d85a8ff7427e5394e9906f))
+* **acumatica:** per-tenant lockout key on AcumaticaClient ([#7](https://github.com/studio-b-ai/clients/issues/7)) ([2eb0c7d](https://github.com/studio-b-ai/clients/commit/2eb0c7d20750d638faed2ea5a99e39e1d60622c2))
+
 ## 1.0.0 (2026-04-19)
 
 
