@@ -23,6 +23,23 @@ import { matchError, genericError, AccountLockedError, type AcumaticaError } fro
 import { AcumaticaCircuitBreaker, CircuitOpenError } from './circuit-breaker.js';
 import { poolLockoutKey, poolKeyPrefix } from './session-pool.js';
 
+// -- Pool-managed session error --
+
+/**
+ * Thrown by a pool-managed AcumaticaClient when its pre-seeded session
+ * expires (401) or nears TTL. The SessionPool.withSession() catch block
+ * detects this via statusCode === 401 and retries with a fresh slot.
+ */
+export class PooledSessionExpiredError extends Error {
+  /** statusCode=401 makes SessionPool.is401Error() detect this as a session expiry */
+  readonly statusCode = 401;
+
+  constructor() {
+    super('Pool-managed session expired — evict slot and retry via SessionPool');
+    this.name = 'PooledSessionExpiredError';
+  }
+}
+
 // -- Call Counter --
 
 export class CallCounter {
@@ -108,6 +125,14 @@ export interface AcumaticaClientOptions {
    * If not provided, lockout guard is disabled (standalone mode).
    */
   redis?: { get(key: string): Promise<string | null>; set(key: string, value: string, ...args: unknown[]): Promise<unknown>; };
+  /**
+   * If provided, pre-seeds this client with the given cookie string and marks
+   * it as pool-managed. Pool-managed clients skip the internal login/re-login
+   * cycle. When the cookie expires (detected via 401), they throw
+   * `PooledSessionExpiredError` instead of re-logging in — signalling the
+   * `SessionPool` to evict the slot and retry with a fresh one.
+   */
+  initialCookies?: string;
 }
 
 // -- Client --
@@ -143,6 +168,8 @@ export class AcumaticaClient {
   readonly callCounter: CallCounter;
   private log: Logger;
   private redis?: AcumaticaClientOptions['redis'];
+  /** Set to true when constructed with initialCookies — disables internal login. */
+  private poolManaged = false;
   /** Per-(baseUrl, username, tenant) Redis key for AccountLocked flag. */
   readonly lockoutKey: string;
   /** Per-(baseUrl, username, tenant) Redis key for the login-failure budget counter. */
@@ -170,6 +197,12 @@ export class AcumaticaClient {
     this.agent = new Agent({
       connect: { timeout: opts.requestTimeoutMs ?? 60_000 },
     });
+    if (opts.initialCookies) {
+      this.cookies = opts.initialCookies;
+      this.loggedIn = true;
+      this.sessionStart = Date.now();
+      this.poolManaged = true;
+    }
   }
 
   // -- Test hooks (non-production) --
@@ -265,6 +298,11 @@ export class AcumaticaClient {
       this.log.debug('Session near expiry, refreshing');
       this.loggedIn = false;
       this.cookies = '';
+    }
+
+    // Pool-managed: don't attempt internal re-login; signal the pool to evict + retry
+    if (this.poolManaged && !this.loggedIn) {
+      throw new PooledSessionExpiredError();
     }
 
     if (this.loggedIn) return;
