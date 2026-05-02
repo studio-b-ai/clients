@@ -1,4 +1,4 @@
-export { AcumaticaClient, CallCounter } from './client.js';
+export { AcumaticaClient, CallCounter, PooledSessionExpiredError } from './client.js';
 export type { AcumaticaClientOptions } from './client.js';
 export { AcumaticaCircuitBreaker, CircuitOpenError, isLockoutError } from './circuit-breaker.js';
 export type { CircuitState, CircuitBreakerOptions } from './circuit-breaker.js';
