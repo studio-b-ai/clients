@@ -473,7 +473,11 @@ export class SessionPool {
       msg.includes('ECONNRESET') ||
       msg.includes('Connection is closed') ||
       msg.includes('Socket closed unexpectedly') ||
-      msg.includes('connect ECONNREFUSED')
+      msg.includes('connect ECONNREFUSED') ||
+      // ioredis MaxRetriesPerRequestError — thrown when a command is in-flight
+      // during a disconnect and the configured maxRetriesPerRequest (1) is
+      // exhausted before a reply arrives. Same degraded-fallback applies.
+      msg.includes('max retries per request')
     );
   }
 

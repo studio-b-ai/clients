@@ -506,6 +506,26 @@ describe('SessionPool', () => {
       expect(handle.degraded).toBe(true);
     });
 
+    it('MaxRetriesPerRequestError (ioredis in-flight exhaustion) is treated as connection error', async () => {
+      // When a Redis command is in-flight during a disconnect and
+      // maxRetriesPerRequest (1) is exhausted, ioredis rejects with this message.
+      // Must fall back to degraded, not propagate to callers.
+      const fakeRedis = {
+        get: vi.fn().mockResolvedValue(null),
+        eval: vi.fn().mockRejectedValue(
+          new Error('Reached the max retries per request limit (which is 1). Refer to "maxRetriesPerRequest" option for details.'),
+        ),
+      };
+
+      const pool = makePoolWithFakeRedis(fakeRedis);
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=degraded-cookie'));
+
+      const handle = await pool.checkout();
+      expect(handle.degraded).toBe(true);
+      const status = await pool.status();
+      expect(status.degraded).toBe(true);
+    });
+
     it('unrelated Redis error (e.g. WRONGTYPE) is NOT swallowed — propagates', async () => {
       const fakeRedis = {
         get: vi.fn().mockResolvedValue(null),
