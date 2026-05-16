@@ -1,11 +1,18 @@
 name: Publish
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'package.json'
+  # Fire ONLY when release-please creates a GitHub release (which creates the tag).
+  # This ensures npm publish and the GH release tag are always created together —
+  # eliminating the drift that occurred when package.json was bumped in a feature
+  # commit (PR #11) and publish.yml fired immediately while the release-please PR
+  # (#8) was never merged, leaving npm at 1.1.0 with no v1.1.0 GH release tag.
+  #
+  # Flow: feature merges → release-please opens release PR → Kevin merges release
+  # PR → release-please creates GH release + tag → this workflow fires → npm publish.
+  #
+  # If you ever need to publish without a GH release (emergency), use workflow_dispatch.
+  release:
+    types: [published]
   workflow_dispatch:
 
 # Tests run in ci.yml on every push to main; this workflow only handles
