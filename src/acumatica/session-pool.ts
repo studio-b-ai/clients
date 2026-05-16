@@ -458,6 +458,25 @@ export class SessionPool {
     return setCookies.map((c) => c.split(';')[0]).join('; ');
   }
 
+  /**
+   * Detect whether a thrown error is a Redis connection/socket error that
+   * requires falling back to degraded mode.  These errors are thrown
+   * synchronously from `redis.eval()` / `redis.scard()` BEFORE ioredis's
+   * async 'error' event fires, so `this.degraded` is still false at the
+   * point of the throw.
+   */
+  private isRedisConnectionError(err: unknown): boolean {
+    const msg = (err as Error)?.message ?? '';
+    return (
+      msg.includes("Stream isn't writeable") ||
+      msg.includes('enableOfflineQueue') ||
+      msg.includes('ECONNRESET') ||
+      msg.includes('Connection is closed') ||
+      msg.includes('Socket closed unexpectedly') ||
+      msg.includes('connect ECONNREFUSED')
+    );
+  }
+
   /** Checkout a session slot. Returns a handle with cookie. */
   async checkout(): Promise<SessionHandle> {
     const started = Date.now();
@@ -484,16 +503,32 @@ export class SessionPool {
       );
     }
 
-    // Try CHECKOUT_LUA — find available or stale slot
-    const result = await redis.eval(
-      CHECKOUT_LUA,
-      1,
-      slotsKey(this.keyPrefix),
-      this.keyPrefix,
-      this.serviceId,
-      String(Date.now()),
-      String(this.staleCheckoutMs),
-    ) as [string | null, string?];
+    // Try CHECKOUT_LUA — find available or stale slot.
+    // Catch synchronous Redis connection errors: ioredis throws before the
+    // async 'error' event fires when enableOfflineQueue=false and the socket
+    // is gone, so this.degraded is still false at throw time.
+    let result: [string | null, string?];
+    try {
+      result = await redis.eval(
+        CHECKOUT_LUA,
+        1,
+        slotsKey(this.keyPrefix),
+        this.keyPrefix,
+        this.serviceId,
+        String(Date.now()),
+        String(this.staleCheckoutMs),
+      ) as [string | null, string?];
+    } catch (err) {
+      if (this.isRedisConnectionError(err)) {
+        this.degraded = true;
+        this.log.warn(
+          { err: (err as Error).message },
+          'Session pool degraded: Redis connection error during CHECKOUT_LUA eval',
+        );
+        return this.degradedCheckout();
+      }
+      throw err;
+    }
 
     if (result[0]) {
       this.log.debug({ slotId: result[0] }, 'Checked out existing slot');
@@ -506,24 +541,67 @@ export class SessionPool {
       };
     }
 
-    // No available slot — check if under capacity
-    const activeCount = await redis.scard(slotsKey(this.keyPrefix));
+    // No available slot — check if under capacity.
+    // Same synchronous-throw guard for scard().
+    let activeCount: number;
+    try {
+      activeCount = await redis.scard(slotsKey(this.keyPrefix));
+    } catch (err) {
+      if (this.isRedisConnectionError(err)) {
+        this.degraded = true;
+        this.log.warn(
+          { err: (err as Error).message },
+          'Session pool degraded: Redis connection error during scard',
+        );
+        return this.degradedCheckout();
+      }
+      throw err;
+    }
+
     if (activeCount < this.maxSize) {
-      // Login and create a new slot
+      // Login and create a new slot.
+      // Same synchronous-throw guard for CREATE_SLOT_LUA eval().
       const cookie = await this.loginToAcumatica();
       const newSlotId = `slot-${randomUUID().slice(0, 8)}`;
       const now = String(Date.now());
 
-      await redis.eval(
-        CREATE_SLOT_LUA,
-        2,
-        slotsKey(this.keyPrefix),
-        slotKey(this.keyPrefix, newSlotId),
-        newSlotId,
-        cookie,
-        this.serviceId,
-        now,
-      );
+      try {
+        await redis.eval(
+          CREATE_SLOT_LUA,
+          2,
+          slotsKey(this.keyPrefix),
+          slotKey(this.keyPrefix, newSlotId),
+          newSlotId,
+          cookie,
+          this.serviceId,
+          now,
+        );
+      } catch (err) {
+        if (this.isRedisConnectionError(err)) {
+          this.degraded = true;
+          this.log.warn(
+            { err: (err as Error).message },
+            'Session pool degraded: Redis connection error during CREATE_SLOT_LUA eval',
+          );
+          // Cookie already obtained — hand it back as a degraded slot so the
+          // caller does not lose the fresh session.
+          const degradedSlotId = `degraded-${randomUUID().slice(0, 8)}`;
+          this.localSlots.set(degradedSlotId, {
+            cookie,
+            checkedOutBy: this.serviceId,
+            checkedOutAt: Date.now(),
+            createdAt: Date.now(),
+          });
+          return {
+            slotId: degradedSlotId,
+            cookie,
+            checkedOutBy: this.serviceId,
+            checkedOutAt: Date.now(),
+            degraded: true,
+          };
+        }
+        throw err;
+      }
 
       this.log.debug({ slotId: newSlotId }, 'Created new pool slot');
       return {
@@ -550,15 +628,29 @@ export class SessionPool {
 
       await new Promise((r) => setTimeout(r, this.pollIntervalMs));
 
-      const result = await redis.eval(
-        CHECKOUT_LUA,
-        1,
-        slotsKey(this.keyPrefix),
-        this.keyPrefix,
-        this.serviceId,
-        String(Date.now()),
-        String(this.staleCheckoutMs),
-      ) as [string | null, string?];
+      // Same synchronous-throw guard for CHECKOUT_LUA inside the poll loop.
+      let result: [string | null, string?];
+      try {
+        result = await redis.eval(
+          CHECKOUT_LUA,
+          1,
+          slotsKey(this.keyPrefix),
+          this.keyPrefix,
+          this.serviceId,
+          String(Date.now()),
+          String(this.staleCheckoutMs),
+        ) as [string | null, string?];
+      } catch (err) {
+        if (this.isRedisConnectionError(err)) {
+          this.degraded = true;
+          this.log.warn(
+            { err: (err as Error).message },
+            'Session pool degraded: Redis connection error during poll CHECKOUT_LUA eval',
+          );
+          return this.degradedCheckout();
+        }
+        throw err;
+      }
 
       if (result[0]) {
         this.log.debug({ slotId: result[0], waitMs: Date.now() - started }, 'Checked out slot after wait');
