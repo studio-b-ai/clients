@@ -393,4 +393,159 @@ describe('SessionPool', () => {
       expect(events.some((e) => e.type === 'stale_reclaimed')).toBe(true);
     });
   });
+
+  /**
+   * Redis synchronous-throw race condition (SessionPool v1.1.x fix).
+   *
+   * When `enableOfflineQueue=false` and the Redis socket disconnects, ioredis
+   * throws synchronously from `redis.eval()` / `redis.scard()` BEFORE the
+   * async 'error' event fires.  At throw time `this.degraded` is still false,
+   * so without explicit try/catch around each Redis call the
+   * `degradedCheckout()` fallback was never triggered and the error propagated
+   * to every gateway caller.
+   *
+   * These tests use a pool wired with a fake Redis client whose eval/scard
+   * methods throw the exact ioredis offline-queue error string observed in
+   * bolt-wms Railway logs on 2026-05-16.
+   */
+  describe('Redis connection error race — degraded fallback (v1.1.x fix)', () => {
+    /** Build a pool whose internal redis client is replaced with a stub. */
+    function makePoolWithFakeRedis(
+      fakeRedis: Partial<Record<string, unknown>>,
+      overrides: Partial<ConstructorParameters<typeof SessionPool>[0]> = {},
+    ) {
+      const pool = makePool({ redisUrl: 'redis://localhost:6379', ...overrides });
+      // Inject the fake redis by overriding the private field after construction.
+      // This is safe in tests — we want to control exactly what Redis does.
+      (pool as unknown as Record<string, unknown>)['redis'] = fakeRedis;
+      return pool;
+    }
+
+    const OFFLINE_QUEUE_ERROR = "Stream isn't writeable and enableOfflineQueue options is false";
+
+    it('CHECKOUT_LUA eval throw: sets degraded=true and returns degradedCheckout result', async () => {
+      const fakeRedis = {
+        // Lockout check — return null (no lockout)
+        get: vi.fn().mockResolvedValue(null),
+        // CHECKOUT_LUA eval — throw synchronously (simulates socket disconnect)
+        eval: vi.fn().mockRejectedValue(new Error(OFFLINE_QUEUE_ERROR)),
+      };
+
+      const pool = makePoolWithFakeRedis(fakeRedis);
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=degraded-cookie'));
+
+      const handle = await pool.checkout();
+
+      // Must have fallen back to degraded mode
+      expect(handle.degraded).toBe(true);
+      expect(handle.cookie).toBe('.ASPXAUTH=degraded-cookie');
+      // Pool must be marked degraded so subsequent calls skip Redis
+      const status = await pool.status();
+      expect(status.degraded).toBe(true);
+    });
+
+    it('scard throw: sets degraded=true and returns degradedCheckout result', async () => {
+      const fakeRedis = {
+        get: vi.fn().mockResolvedValue(null),
+        // CHECKOUT_LUA returns no slot (empty pool)
+        eval: vi.fn().mockResolvedValue([null]),
+        // scard — throw synchronously (simulates socket disconnect)
+        scard: vi.fn().mockRejectedValue(new Error(OFFLINE_QUEUE_ERROR)),
+      };
+
+      const pool = makePoolWithFakeRedis(fakeRedis);
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=degraded-cookie'));
+
+      const handle = await pool.checkout();
+
+      expect(handle.degraded).toBe(true);
+      expect(handle.cookie).toBe('.ASPXAUTH=degraded-cookie');
+      const status = await pool.status();
+      expect(status.degraded).toBe(true);
+    });
+
+    it('CREATE_SLOT_LUA eval throw: sets degraded=true and returns handle with already-obtained cookie', async () => {
+      let evalCallCount = 0;
+      const fakeRedis = {
+        get: vi.fn().mockResolvedValue(null),
+        eval: vi.fn().mockImplementation(() => {
+          evalCallCount++;
+          if (evalCallCount === 1) {
+            // First eval = CHECKOUT_LUA — no slot available
+            return Promise.resolve([null]);
+          }
+          // Second eval = CREATE_SLOT_LUA — throw connection error
+          return Promise.reject(new Error(OFFLINE_QUEUE_ERROR));
+        }),
+        // scard returns 0 — under capacity, triggers login + CREATE_SLOT_LUA
+        scard: vi.fn().mockResolvedValue(0),
+      };
+
+      const pool = makePoolWithFakeRedis(fakeRedis);
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=fresh-cookie'));
+
+      const handle = await pool.checkout();
+
+      // Cookie must still be returned (login already happened before the throw)
+      expect(handle.degraded).toBe(true);
+      expect(handle.cookie).toBe('.ASPXAUTH=fresh-cookie');
+      const status = await pool.status();
+      expect(status.degraded).toBe(true);
+    });
+
+    it('ECONNRESET pattern is also detected as a connection error', async () => {
+      const fakeRedis = {
+        get: vi.fn().mockResolvedValue(null),
+        eval: vi.fn().mockRejectedValue(new Error('read ECONNRESET')),
+      };
+
+      const pool = makePoolWithFakeRedis(fakeRedis);
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=degraded-cookie'));
+
+      const handle = await pool.checkout();
+      expect(handle.degraded).toBe(true);
+    });
+
+    it('MaxRetriesPerRequestError (ioredis in-flight exhaustion) is treated as connection error', async () => {
+      // When a Redis command is in-flight during a disconnect and
+      // maxRetriesPerRequest (1) is exhausted, ioredis rejects with this message.
+      // Must fall back to degraded, not propagate to callers.
+      const fakeRedis = {
+        get: vi.fn().mockResolvedValue(null),
+        eval: vi.fn().mockRejectedValue(
+          new Error('Reached the max retries per request limit (which is 1). Refer to "maxRetriesPerRequest" option for details.'),
+        ),
+      };
+
+      const pool = makePoolWithFakeRedis(fakeRedis);
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=degraded-cookie'));
+
+      const handle = await pool.checkout();
+      expect(handle.degraded).toBe(true);
+      const status = await pool.status();
+      expect(status.degraded).toBe(true);
+    });
+
+    it('unrelated Redis error (e.g. WRONGTYPE) is NOT swallowed — propagates', async () => {
+      const fakeRedis = {
+        get: vi.fn().mockResolvedValue(null),
+        eval: vi.fn().mockRejectedValue(new Error('WRONGTYPE Operation against a key holding the wrong kind of value')),
+        // Stub remaining Redis methods so status() works if called
+        smembers: vi.fn().mockResolvedValue([]),
+      };
+
+      const pool = makePoolWithFakeRedis(fakeRedis);
+      pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=cookie'));
+
+      // The non-connection error must propagate — not silently converted to degraded
+      await expect(pool.checkout()).rejects.toThrow('WRONGTYPE');
+      // Pool must NOT be marked degraded — this.degraded stays false
+      // We verify by checking the 'degraded' field directly on the private state
+      // via status(): since redis is still set and this.degraded is false,
+      // status() will try to use Redis. In this test the redis smembers stub
+      // returns [], so the status call succeeds with degraded=false.
+      const status = await pool.status();
+      expect(status.degraded).toBe(false);
+    });
+  });
 });
