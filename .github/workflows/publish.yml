@@ -12,6 +12,21 @@ on:
 # the npm publish step (gated separately so a publish failure doesn't
 # masquerade as a test failure, and so PRs aren't blocked on a workflow
 # that by definition can't run pre-merge).
+#
+# DRIFT PREVENTION: A version-already-published guard in the publish step
+# ensures we skip silently if the version in package.json is already on npm.
+# This prevents the drift pattern from PR #11 (package.json bumped to 1.1.0
+# in a feature commit → publish.yml published 1.1.0 to npm immediately →
+# release-please PR #8 was never merged → no v1.1.0 GH release tag created).
+# Now, when a feature branch bumps package.json and publishes, that version
+# is already on npm by the time release-please's release PR merges — the guard
+# skips the duplicate publish, which is harmless. The GH release tag is what
+# was missing; the one-time repair below creates it.
+#
+# NOTE: We do NOT use `on: release: types: [published]` even though it seems
+# more elegant, because GitHub suppresses workflow runs triggered by the
+# default GITHUB_TOKEN — and release-please uses GITHUB_TOKEN to create
+# releases. The push trigger is what actually fires reliably.
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -27,13 +42,29 @@ jobs:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Check if version already published
+        id: version_check
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "@studio-b-ai/clients@${VERSION}" version --registry https://registry.npmjs.org 2>/dev/null | grep -q "^${VERSION}$"; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} is already on npm — skipping publish."
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            echo "Version ${VERSION} not yet on npm — will publish."
+          fi
+
       - name: Install dependencies
+        if: steps.version_check.outputs.already_published == 'false'
         run: npm ci --no-audit --no-fund
 
       - name: Build
+        if: steps.version_check.outputs.already_published == 'false'
         run: npm run build
 
       - name: Publish with provenance
+        if: steps.version_check.outputs.already_published == 'false'
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
