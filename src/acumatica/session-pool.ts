@@ -11,9 +11,19 @@
  * Redis data model (PREFIX = `acumatica:pool:{b64(baseUrl)}:{account}:{b64(company)}`):
  *   {PREFIX}:meta    — hash (maxSize, activeLogins)
  *   {PREFIX}:slots   — set of active slot IDs
- *   {PREFIX}:slot:{id} — hash (cookie, timestamps, checkout state)
+ *   {PREFIX}:slot:{id} — hash (cookie, timestamps, checkout state) — has TTL
  *   {PREFIX}:login-failures — string with TTL (failure counter)
  *   acumatica:lockout:{b64(baseUrl)}:{account}:{b64(company)} — string with TTL
+ *
+ * Orphan prevention (v1.2.0):
+ *   1. withSession no longer calls checkin() on a handle that was evicted in
+ *      the 401-retry branch — the evicted slot is tracked via `_evictedSlotIds`
+ *      and skipped in the outer finally block.
+ *   2. Every slot hash is given a defensive TTL (slotTtlMs, default 2h) so any
+ *      stray record self-expires even if cleanup logic fails.
+ *   3. A reaper sweep (run at each keepalive cycle) removes orphan hashes:
+ *      NOT in the :slots set, no cookie field, lastUsedAt older than
+ *      staleCheckoutMs. Active cookied/in-set slots are never touched.
  *
  * Note: pre-2026-04-19 keys (account-only scope) are abandoned on upgrade.
  * They will expire naturally via the AcumaticaClient session TTL or can be
@@ -39,7 +49,7 @@ export interface SessionHandle {
 }
 
 export interface PoolEvent {
-  type: 'pool_exhausted' | 'circuit_trip' | 'slot_evicted' | 'stale_reclaimed';
+  type: 'pool_exhausted' | 'circuit_trip' | 'slot_evicted' | 'stale_reclaimed' | 'orphan_reaped';
   account: string;
   detail: string;
   timestamp: number;
@@ -69,6 +79,13 @@ export interface PoolConfig {
   pollIntervalMs?: number;
   /** Background keepalive interval for idle sessions (ms). Default: 600_000 (10 min) */
   keepaliveMs?: number;
+  /**
+   * Defensive TTL on every slot hash in seconds. Default: 7200 (2h).
+   * A slot hash that somehow escapes both checkin and eviction will self-expire
+   * after this duration, preventing permanent Redis key accumulation.
+   * Set to 0 to disable (not recommended for production).
+   */
+  slotTtlMs?: number;
   /** Optional event callback for observability (Slack alerts, metrics) */
   onEvent?: (event: PoolEvent) => void;
   /** Logger instance */
@@ -194,6 +211,9 @@ const CHECKOUT_LUA = `
 /**
  * CHECKIN_LUA: Return a slot to the pool.
  * KEYS[1] = slotKey, ARGV[1] = now
+ * NOTE: HSET creates the hash if absent. For evicted slots this produces an
+ * orphan. Fix (v1.2.0): withSession skips checkin for evicted handles via
+ * _evictedSlotIds so this code path is no longer reached for evicted slots.
  */
 const CHECKIN_LUA = `
   local sk = KEYS[1]
@@ -204,7 +224,8 @@ const CHECKIN_LUA = `
 /**
  * CREATE_SLOT_LUA: Create a new slot and add to the index.
  * KEYS[1] = slotsKey, KEYS[2] = slotKey
- * ARGV[1] = slotId, ARGV[2] = cookie, ARGV[3] = serviceId, ARGV[4] = now
+ * ARGV[1] = slotId, ARGV[2] = cookie, ARGV[3] = serviceId, ARGV[4] = now,
+ * ARGV[5] = ttlSeconds (0 = no TTL)
  */
 const CREATE_SLOT_LUA = `
   local slotsKey = KEYS[1]
@@ -213,6 +234,7 @@ const CREATE_SLOT_LUA = `
   local cookie = ARGV[2]
   local serviceId = ARGV[3]
   local now = ARGV[4]
+  local ttlSeconds = tonumber(ARGV[5])
 
   redis.call('SADD', slotsKey, slotId)
   redis.call('HSET', sk,
@@ -221,6 +243,9 @@ const CREATE_SLOT_LUA = `
     'lastUsedAt', now,
     'checkedOutBy', serviceId,
     'checkedOutAt', now)
+  if ttlSeconds > 0 then
+    redis.call('EXPIRE', sk, ttlSeconds)
+  end
   return 1
 `;
 
@@ -243,6 +268,8 @@ export class SessionPool {
   readonly checkoutTimeoutMs: number;
   readonly pollIntervalMs: number;
   readonly keepaliveMs: number;
+  /** Defensive TTL on slot hashes in milliseconds. 0 = disabled. */
+  readonly slotTtlMs: number;
 
   private credentials: PoolConfig['credentials'];
   private redisUrl: string;
@@ -258,6 +285,13 @@ export class SessionPool {
 
   /** In-memory slot store for degraded mode (no Redis) */
   private localSlots = new Map<string, { cookie: string; checkedOutBy: string; checkedOutAt: number; createdAt: number }>();
+
+  /**
+   * Slot IDs evicted during the current withSession invocation.
+   * The outer finally block checks this set before calling checkin() to avoid
+   * recreating zombie hashes on already-deleted slot keys (v1.2.0 fix).
+   */
+  readonly _evictedSlotIds = new Set<string>();
 
   /** Test hook to replace the HTTP login call */
   private loginFn: (() => Promise<string>) | null = null;
@@ -278,6 +312,7 @@ export class SessionPool {
     this.checkoutTimeoutMs = config.checkoutTimeoutMs ?? 30_000;
     this.pollIntervalMs = config.pollIntervalMs ?? 2_000;
     this.keepaliveMs = config.keepaliveMs ?? 600_000;
+    this.slotTtlMs = config.slotTtlMs ?? 7_200_000; // 2h default
     this.log = config.logger ?? pino({ name: `session-pool:${config.account}` });
     this.keyPrefix = poolKeyPrefix(
       config.credentials.baseUrl,
@@ -329,7 +364,7 @@ export class SessionPool {
     }
   }
 
-  /** Ping all idle (not checked-out) slots. Evict any that return 401. */
+  /** Ping all idle (not checked-out) slots. Evict any that return 401. Also runs orphan reaper. */
   private async pingIdleSlots(): Promise<void> {
     // Degraded mode: iterate local slots
     for (const [sid, slot] of this.localSlots) {
@@ -361,6 +396,85 @@ export class SessionPool {
         }
       }
     }
+
+    // Run orphan reaper as part of every keepalive cycle
+    await this.reapOrphanSlots(redis);
+  }
+
+  /**
+   * Reap orphan slot hashes: hashes that are NOT in the :slots set, have no
+   * cookie field (were never successfully created or were evicted), and whose
+   * lastUsedAt/createdAt is older than staleCheckoutMs.
+   *
+   * Root cause: withSession's outer finally called CHECKIN_LUA on an evicted
+   * slot. CHECKIN_LUA uses HSET which recreates the key even if DEL'd,
+   * producing a zombie hash with checkedOutBy='' and no cookie. This reaper
+   * removes those zombies.
+   *
+   * Safety invariants (NEVER violated):
+   *   - A slot ID present in the :slots set is never reaped (active slot).
+   *   - A hash with a cookie field is never reaped (live Acumatica session).
+   *   - A hash whose lastUsedAt/createdAt is within staleCheckoutMs is skipped
+   *     (could be mid-acquire in another process).
+   *
+   * Exposed publicly so callers (e.g. session-pool-registry) can invoke it
+   * on startup to clear the backlog before serving traffic.
+   */
+  async reapOrphanSlots(redisClient?: Redis | null): Promise<number> {
+    const redis = redisClient ?? this.getRedis();
+    if (!redis || this.degraded) return 0;
+
+    const now = Date.now();
+
+    // Get the set of active slot IDs — never reap these
+    const activeSlotIds = new Set(await redis.smembers(slotsKey(this.keyPrefix)));
+
+    // Scan for all slot hashes under this pool's prefix
+    const pattern = `${this.keyPrefix}:slot:*`;
+    let cursor = '0';
+    const orphanKeys: string[] = [];
+
+    do {
+      const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+      cursor = nextCursor;
+
+      for (const key of keys) {
+        // Extract slotId from key: `{prefix}:slot:{slotId}`
+        const slotId = key.slice(this.keyPrefix.length + ':slot:'.length);
+
+        // Safety check 1: never reap an active (in-set) slot
+        if (activeSlotIds.has(slotId)) continue;
+
+        const hashData = await redis.hgetall(key);
+        if (!hashData || Object.keys(hashData).length === 0) continue;
+
+        // Safety check 2: never reap a slot with a live cookie
+        if (hashData.cookie) continue;
+
+        // Safety check 3: only reap if the record is old enough
+        // (avoids racing with a slow mid-acquire in another process)
+        const lastUsedAt = parseInt(hashData.lastUsedAt ?? hashData.createdAt ?? '0', 10);
+        if (lastUsedAt > 0 && (now - lastUsedAt) < this.staleCheckoutMs) continue;
+
+        orphanKeys.push(key);
+      }
+    } while (cursor !== '0');
+
+    if (orphanKeys.length === 0) return 0;
+
+    // Delete orphans in one pipeline
+    const pipeline = redis.pipeline();
+    for (const key of orphanKeys) {
+      pipeline.del(key);
+    }
+    await pipeline.exec();
+
+    this.log.info(
+      { count: orphanKeys.length, account: this.account },
+      'Reaped orphan slot hashes',
+    );
+    this.emit('orphan_reaped', `Reaped ${orphanKeys.length} orphan slot hashes`);
+    return orphanKeys.length;
   }
 
   /** Ping an Acumatica session to check if it's still valid */
@@ -568,6 +682,7 @@ export class SessionPool {
       const cookie = await this.loginToAcumatica();
       const newSlotId = `slot-${randomUUID().slice(0, 8)}`;
       const now = String(Date.now());
+      const ttlSeconds = this.slotTtlMs > 0 ? String(Math.ceil(this.slotTtlMs / 1000)) : '0';
 
       try {
         await redis.eval(
@@ -579,6 +694,7 @@ export class SessionPool {
           cookie,
           this.serviceId,
           now,
+          ttlSeconds,
         );
       } catch (err) {
         if (this.isRedisConnectionError(err)) {
@@ -698,9 +814,19 @@ export class SessionPool {
    * Checkout → run fn → checkin (in finally).
    * On 401: evict slot, retry once with fresh slot.
    * On AccountLockedError: evict all, trip breaker, re-throw.
+   *
+   * Fix (v1.2.0): the outer finally block skips checkin if the handle was
+   * evicted in the 401-retry branch. Previously CHECKIN_LUA's HSET on the
+   * evicted (DEL'd) slot key recreated a zombie hash with no cookie and not
+   * in the :slots set — accumulating into the ~89 orphan keys observed in
+   * production (2026-06-04). `_evictedSlotIds` tracks evictions within this
+   * call so the finally block can skip them safely.
    */
   async withSession<T>(fn: (handle: SessionHandle) => Promise<T>): Promise<T> {
     const handle = await this.checkout();
+    // Clear any stale tracking from a previous call on this pool instance
+    this._evictedSlotIds.delete(handle.slotId);
+
     try {
       return await fn(handle);
     } catch (err) {
@@ -716,6 +842,8 @@ export class SessionPool {
       if (this.is401Error(err)) {
         this.log.warn({ slotId: handle.slotId }, 'Session expired (401), evicting and retrying');
         await this.evictSlot(handle.slotId, handle.degraded);
+        // Mark this handle as evicted so the outer finally skips checkin
+        this._evictedSlotIds.add(handle.slotId);
 
         // Retry once with a fresh slot
         const retryHandle = await this.checkout();
@@ -728,7 +856,13 @@ export class SessionPool {
 
       throw err;
     } finally {
-      await this.checkin(handle);
+      // Skip checkin if this handle was evicted above.
+      // Calling checkin on an evicted (DEL'd) slot key would let CHECKIN_LUA's
+      // HSET recreate the key as a zombie hash (no cookie, not in :slots set).
+      if (!this._evictedSlotIds.has(handle.slotId)) {
+        await this.checkin(handle);
+      }
+      this._evictedSlotIds.delete(handle.slotId);
     }
   }
 
