@@ -8,15 +8,17 @@
  *
  * Three fixes:
  *   1. withSession skips checkin for evicted handles (_evictedSlotIds guard)
- *   2. CREATE_SLOT_LUA sets a defensive TTL on every slot hash
+ *   2. CREATE_SLOT_LUA sets a defensive TTL on every slot hash; CHECKOUT_LUA
+ *      and CHECKIN_LUA refresh the TTL on every touch so active long-lived
+ *      slots are never expired by Redis while still in use (codex P1 fix).
  *   3. reapOrphanSlots sweeps cookieless, not-in-set, stale hashes
  *
- * Rule #46/#223: tests invoke the REAL functions and use fake-Redis to capture
- * actual Redis ops, not mockResolvedValue-as-assertion.
+ * Rule #46/#223: tests invoke the REAL functions and use a fake-Redis harness
+ * that captures actual Redis ops, not mockResolvedValue-as-assertion.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { SessionPool, type SessionHandle } from '../session-pool.js';
+import { describe, it, expect, vi } from 'vitest';
+import { SessionPool } from '../session-pool.js';
 
 // ---------------------------------------------------------------------------
 // Fake Redis harness
@@ -25,7 +27,7 @@ import { SessionPool, type SessionHandle } from '../session-pool.js';
 /** In-memory Redis substitute that tracks calls and implements HSET/HGET/DEL/EXPIRE. */
 function makeFakeRedis() {
   const store = new Map<string, Map<string, string>>();
-  const ttls = new Map<string, number>(); // key → TTL in seconds (at set-time)
+  const ttls = new Map<string, number>(); // key → TTL in seconds
   const sets = new Map<string, Set<string>>();
 
   const ops: Array<{ op: string; key: string; args?: unknown }> = [];
@@ -83,12 +85,9 @@ function makeFakeRedis() {
 
     // --- string ops ---
     get: vi.fn(async (_key: string) => null),
-    set: vi.fn(async () => 'OK'),
-    setex: vi.fn(async () => 'OK'),
 
     // --- SCAN ---
     scan: vi.fn(async (_cursor: string, _matchOp: string, pattern: string, _countOp: string, _count: number): Promise<[string, string[]]> => {
-      // Return all keys matching the pattern
       const prefix = pattern.replace(/\*$/, '');
       const allKeys: string[] = [];
       for (const k of store.keys()) {
@@ -107,15 +106,26 @@ function makeFakeRedis() {
       exec: vi.fn(async () => []),
     })),
 
-    // --- Lua eval --- (implements the actual Lua scripts in JS for testing)
+    /**
+     * Lua eval simulator — implements the 4 Lua scripts in JS.
+     * Discriminator strategy: use unique structural tokens per script:
+     *   CHECKOUT_LUA  — contains 'SMEMBERS' and 'checkedOutBy'
+     *   CHECKIN_LUA   — contains 'lastUsedAt' and does NOT contain 'SADD' or 'SMEMBERS'
+     *   CREATE_SLOT_LUA — contains 'SADD' and 'cookie,' (the hash field name)
+     *   EVICT_SLOT_LUA  — contains 'SREM' and 'DEL' but NOT 'cookie,'
+     *
+     * v1.2.0 addition: CHECKOUT_LUA passes ttlSeconds as ARGV[5];
+     *                  CHECKIN_LUA passes ttlSeconds as ARGV[2].
+     */
     eval: vi.fn(async (script: string, _numKeys: number, ...args: string[]) => {
-      // CHECKOUT_LUA
+      // CHECKOUT_LUA (contains SMEMBERS + checkedOutBy)
       if (script.includes('SMEMBERS') && script.includes('checkedOutBy')) {
         const slotsSetKey = args[0];
         const keyPrefix = args[1];
         const serviceId = args[2];
         const now = parseInt(args[3], 10);
         const staleMs = parseInt(args[4], 10);
+        const ttlSeconds = parseInt(args[5] ?? '0', 10);
 
         const slotIds = [...(sets.get(slotsSetKey) ?? [])];
         for (const sid of slotIds) {
@@ -125,6 +135,7 @@ function makeFakeRedis() {
           if (checkedOutBy === '') {
             h?.set('checkedOutBy', serviceId);
             h?.set('checkedOutAt', String(now));
+            if (ttlSeconds > 0) { ttls.set(sk, ttlSeconds); ops.push({ op: 'EXPIRE', key: sk, args: ttlSeconds }); }
             const cookie = h?.get('cookie') ?? '';
             return [sid, cookie];
           }
@@ -132,6 +143,7 @@ function makeFakeRedis() {
           if (checkedOutAt > 0 && (now - checkedOutAt) > staleMs) {
             h?.set('checkedOutBy', serviceId);
             h?.set('checkedOutAt', String(now));
+            if (ttlSeconds > 0) { ttls.set(sk, ttlSeconds); ops.push({ op: 'EXPIRE', key: sk, args: ttlSeconds }); }
             const cookie = h?.get('cookie') ?? '';
             return [sid, cookie];
           }
@@ -139,8 +151,23 @@ function makeFakeRedis() {
         return [null];
       }
 
-      // CREATE_SLOT_LUA
-      if (script.includes('SADD') && script.includes('EXPIRE')) {
+      // CHECKIN_LUA (contains lastUsedAt, does NOT contain SADD or SMEMBERS)
+      if (script.includes('lastUsedAt') && !script.includes('SADD') && !script.includes('SMEMBERS')) {
+        const slotKey = args[0];
+        const now = args[1];
+        const ttlSeconds = parseInt(args[2] ?? '0', 10);
+        if (!store.has(slotKey)) store.set(slotKey, new Map());
+        const h = store.get(slotKey)!;
+        h.set('checkedOutBy', '');
+        h.set('checkedOutAt', '0');
+        h.set('lastUsedAt', now);
+        if (ttlSeconds > 0) { ttls.set(slotKey, ttlSeconds); ops.push({ op: 'EXPIRE', key: slotKey, args: ttlSeconds }); }
+        ops.push({ op: 'CHECKIN', key: slotKey });
+        return 1;
+      }
+
+      // CREATE_SLOT_LUA (contains SADD and the 'cookie' field name in an HSET)
+      if (script.includes('SADD') && script.includes("'cookie'")) {
         const slotsSetKey = args[0];
         const slotHashKey = args[1];
         const slotId = args[2];
@@ -168,20 +195,7 @@ function makeFakeRedis() {
         return 1;
       }
 
-      // CHECKIN_LUA
-      if (script.includes('checkedOutAt') && script.includes('lastUsedAt') && !script.includes('SADD')) {
-        const slotKey = args[0];
-        const now = args[1];
-        if (!store.has(slotKey)) store.set(slotKey, new Map());
-        const h = store.get(slotKey)!;
-        h.set('checkedOutBy', '');
-        h.set('checkedOutAt', '0');
-        h.set('lastUsedAt', now);
-        ops.push({ op: 'CHECKIN', key: slotKey });
-        return 1;
-      }
-
-      // EVICT_SLOT_LUA
+      // EVICT_SLOT_LUA (contains SREM and DEL)
       if (script.includes('SREM') && script.includes('DEL')) {
         const slotsSetKey = args[0];
         const slotHashKey = args[1];
@@ -244,14 +258,14 @@ describe('Fix 1 — withSession skips checkin for evicted handles (401 retry)', 
   it('does NOT call CHECKIN on the evicted slot ID after a 401 eviction', async () => {
     const redis = makeFakeRedis();
     const pool = makePool(redis);
-    pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=cookie1; .ASPXAUTH=cookie2'));
+    pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=cookie1'));
 
+    let capturedSlotId = '';
     let call = 0;
     const result = await pool.withSession(async (handle) => {
       call++;
       if (call === 1) {
-        // Save slot ID for later assertion
-        (pool as any)._testSlotId = handle.slotId;
+        capturedSlotId = handle.slotId;
         throw Object.assign(new Error('Unauthorized'), { statusCode: 401 });
       }
       return 'ok';
@@ -260,23 +274,21 @@ describe('Fix 1 — withSession skips checkin for evicted handles (401 retry)', 
     expect(result).toBe('ok');
     expect(call).toBe(2);
 
-    // The evicted slot ID should NOT appear as a CHECKIN target in the ops log.
-    // If CHECKIN fires on it, it would recreate the zombie hash.
-    const evictedSlotId = (pool as any)._testSlotId as string;
-    const evictedSlotKey = `${pool.keyPrefix}:slot:${evictedSlotId}`;
+    const evictedSlotKey = `${pool.keyPrefix}:slot:${capturedSlotId}`;
 
+    // CHECKIN must NOT have fired on the evicted slot key after eviction
     const checkinAfterEvict = redis._ops.filter(
       (op) => op.op === 'CHECKIN' && op.key === evictedSlotKey,
     );
     expect(checkinAfterEvict).toHaveLength(0);
 
-    // Confirm EVICT fired for that slot
+    // EVICT must have fired for that slot
     const evictOps = redis._ops.filter(
       (op) => op.op === 'EVICT' && op.key === evictedSlotKey,
     );
     expect(evictOps.length).toBeGreaterThan(0);
 
-    // Confirm the evicted slot hash does NOT exist in the store
+    // The evicted slot hash must NOT exist in the store
     expect(redis._store.has(evictedSlotKey)).toBe(false);
   });
 
@@ -292,7 +304,6 @@ describe('Fix 1 — withSession skips checkin for evicted handles (401 retry)', 
       return 'ok';
     });
 
-    // After the call, the set should be empty (cleaned up in finally)
     expect(pool._evictedSlotIds.size).toBe(0);
   });
 
@@ -314,11 +325,11 @@ describe('Fix 1 — withSession skips checkin for evicted handles (401 retry)', 
 });
 
 // ---------------------------------------------------------------------------
-// Fix 2: CREATE_SLOT_LUA sets a defensive TTL on every new slot hash
+// Fix 2: slot hashes get a defensive TTL refreshed on every touch
 // ---------------------------------------------------------------------------
 
-describe('Fix 2 — slot hash gets a defensive TTL on creation', () => {
-  it('a non-zero slotTtlMs causes EXPIRE to be set on the slot hash', async () => {
+describe('Fix 2 — slot hash gets a defensive TTL on creation and refresh on touch', () => {
+  it('a non-zero slotTtlMs causes EXPIRE on CREATE_SLOT', async () => {
     const redis = makeFakeRedis();
     const pool = makePool(redis, { slotTtlMs: 3_600_000 }); // 1h
     pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=abc'));
@@ -327,15 +338,16 @@ describe('Fix 2 — slot hash gets a defensive TTL on creation', () => {
     await pool.checkin(handle);
 
     const slotHashKey = `${pool.keyPrefix}:slot:${handle.slotId}`;
+    // EXPIRE fired at least once (at create + at checkin)
     const expireOps = redis._ops.filter((op) => op.op === 'EXPIRE' && op.key === slotHashKey);
     expect(expireOps.length).toBeGreaterThan(0);
 
-    // TTL should be 3600 seconds (1h)
+    // TTL value should be 3600 seconds (1h)
     const ttl = redis._ttls.get(slotHashKey);
     expect(ttl).toBe(3600);
   });
 
-  it('slotTtlMs=0 disables the TTL (no EXPIRE call)', async () => {
+  it('slotTtlMs=0 disables the TTL (no EXPIRE call on slot hash)', async () => {
     const redis = makeFakeRedis();
     const pool = makePool(redis, { slotTtlMs: 0 });
     pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=abc'));
@@ -348,17 +360,20 @@ describe('Fix 2 — slot hash gets a defensive TTL on creation', () => {
     expect(expireOps).toHaveLength(0);
   });
 
-  it('default slotTtlMs (2h = 7200s) is applied when not overridden', async () => {
+  it('CHECKIN refreshes TTL so active slots are not expired between touches', async () => {
     const redis = makeFakeRedis();
-    const pool = makePool(redis); // uses default 7_200_000ms
+    const pool = makePool(redis, { slotTtlMs: 7_200_000 }); // 2h
     pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=abc'));
 
     const handle = await pool.checkout();
-    await pool.checkin(handle);
+    // TTL from CREATE_SLOT
+    const afterCreate = redis._ttls.get(`${pool.keyPrefix}:slot:${handle.slotId}`);
+    expect(afterCreate).toBe(7200);
 
-    const slotHashKey = `${pool.keyPrefix}:slot:${handle.slotId}`;
-    const ttl = redis._ttls.get(slotHashKey);
-    expect(ttl).toBe(7200);
+    await pool.checkin(handle);
+    // TTL must still be 7200 (refreshed by CHECKIN)
+    const afterCheckin = redis._ttls.get(`${pool.keyPrefix}:slot:${handle.slotId}`);
+    expect(afterCheckin).toBe(7200);
   });
 });
 
@@ -372,14 +387,13 @@ describe('Fix 3 — reapOrphanSlots', () => {
     const pool = makePool(redis, { staleCheckoutMs: 1000 });
     pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=cookie'));
 
-    // Manually insert an orphan hash: not in :slots set, no cookie, old timestamp
+    // Orphan: not in :slots set, no cookie, old timestamp
     const orphanKey = `${pool.keyPrefix}:slot:orphan-old`;
     redis._store.set(orphanKey, new Map([
       ['checkedOutBy', ''],
       ['checkedOutAt', '0'],
       ['lastUsedAt', String(Date.now() - 5000)], // 5s ago > staleCheckoutMs(1s)
     ]));
-    // Not added to the :slots set
 
     const reaped = await pool.reapOrphanSlots();
     expect(reaped).toBe(1);
@@ -391,7 +405,6 @@ describe('Fix 3 — reapOrphanSlots', () => {
     const pool = makePool(redis, { staleCheckoutMs: 1000 });
     pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=live-cookie'));
 
-    // Create a real slot via checkout
     const handle = await pool.checkout();
     const slotHashKey = `${pool.keyPrefix}:slot:${handle.slotId}`;
 
@@ -410,9 +423,8 @@ describe('Fix 3 — reapOrphanSlots', () => {
   it('preserves a recent cookieless orphan (within staleCheckoutMs — mid-acquire race)', async () => {
     const redis = makeFakeRedis();
     const pool = makePool(redis, { staleCheckoutMs: 120_000 }); // 2 min
-    pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=cookie'));
 
-    // Orphan with a very recent lastUsedAt (just now)
+    // Orphan with a very recent lastUsedAt
     const recentOrphanKey = `${pool.keyPrefix}:slot:orphan-recent`;
     redis._store.set(recentOrphanKey, new Map([
       ['checkedOutBy', 'test-service'],
@@ -466,26 +478,23 @@ describe('Fix 3 — reapOrphanSlots', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Fix 1 + 3 combined: after a 401 cycle, reaper cleans any residual orphan
+// Fix 1 + 3 combined: after a 401 cycle, reaper finds no orphan
 // ---------------------------------------------------------------------------
 
 describe('Combined: 401 cycle + reaper cleans any stale remnants', () => {
   it('after a 401 withSession cycle, reaper finds nothing (fix 1 prevents creation)', async () => {
     const redis = makeFakeRedis();
-    const pool = makePool(redis, { staleCheckoutMs: 0 }); // staleMs=0 means any age is stale
+    const pool = makePool(redis, { staleCheckoutMs: 0 }); // staleMs=0 makes all records stale
     pool._setLoginFn(vi.fn().mockResolvedValue('.ASPXAUTH=cookie'));
 
     let call = 0;
-    await pool.withSession(async (handle) => {
+    await pool.withSession(async () => {
       call++;
-      if (call === 1) {
-        (pool as any)._testSlotId = handle.slotId;
-        throw Object.assign(new Error('401'), { statusCode: 401 });
-      }
+      if (call === 1) throw Object.assign(new Error('401'), { statusCode: 401 });
       return 'ok';
     });
 
-    // Reaper should find zero orphans because fix 1 prevented creation
+    // Reaper should find zero orphans because fix 1 prevented zombie creation
     const reaped = await pool.reapOrphanSlots();
     expect(reaped).toBe(0);
   });

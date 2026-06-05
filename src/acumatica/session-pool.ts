@@ -184,6 +184,7 @@ const CHECKOUT_LUA = `
   local serviceId = ARGV[2]
   local now = tonumber(ARGV[3])
   local staleMs = tonumber(ARGV[4])
+  local ttlSeconds = tonumber(ARGV[5])
 
   local slotIds = redis.call('SMEMBERS', slotsKey)
   for _, sid in ipairs(slotIds) do
@@ -192,6 +193,7 @@ const CHECKOUT_LUA = `
     if checkedOutBy == '' or checkedOutBy == false then
       -- Available slot: check it out
       redis.call('HSET', sk, 'checkedOutBy', serviceId, 'checkedOutAt', tostring(now))
+      if ttlSeconds > 0 then redis.call('EXPIRE', sk, ttlSeconds) end
       local cookie = redis.call('HGET', sk, 'cookie')
       return {sid, cookie or ''}
     else
@@ -200,6 +202,7 @@ const CHECKOUT_LUA = `
       if checkedOutAt > 0 and (now - checkedOutAt) > staleMs then
         -- Reclaim stale slot
         redis.call('HSET', sk, 'checkedOutBy', serviceId, 'checkedOutAt', tostring(now))
+        if ttlSeconds > 0 then redis.call('EXPIRE', sk, ttlSeconds) end
         local cookie = redis.call('HGET', sk, 'cookie')
         return {sid, cookie or ''}
       end
@@ -217,7 +220,9 @@ const CHECKOUT_LUA = `
  */
 const CHECKIN_LUA = `
   local sk = KEYS[1]
+  local ttlSeconds = tonumber(ARGV[2])
   redis.call('HSET', sk, 'checkedOutBy', '', 'checkedOutAt', '0', 'lastUsedAt', ARGV[1])
+  if ttlSeconds > 0 then redis.call('EXPIRE', sk, ttlSeconds) end
   return 1
 `;
 
@@ -635,6 +640,7 @@ export class SessionPool {
         this.serviceId,
         String(Date.now()),
         String(this.staleCheckoutMs),
+        this.slotTtlMs > 0 ? String(Math.ceil(this.slotTtlMs / 1000)) : '0',
       ) as [string | null, string?];
     } catch (err) {
       if (this.isRedisConnectionError(err)) {
@@ -759,6 +765,7 @@ export class SessionPool {
           this.serviceId,
           String(Date.now()),
           String(this.staleCheckoutMs),
+          this.slotTtlMs > 0 ? String(Math.ceil(this.slotTtlMs / 1000)) : '0',
         ) as [string | null, string?];
       } catch (err) {
         if (this.isRedisConnectionError(err)) {
@@ -805,6 +812,7 @@ export class SessionPool {
       1,
       slotKey(this.keyPrefix, handle.slotId),
       String(Date.now()),
+      this.slotTtlMs > 0 ? String(Math.ceil(this.slotTtlMs / 1000)) : '0',
     );
     this.log.debug({ slotId: handle.slotId }, 'Checked in slot');
   }
