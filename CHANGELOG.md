@@ -5,6 +5,14 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2](https://github.com/studio-b-ai/clients/compare/v1.1.1...v1.1.2) (2026-06-05)
+
+
+### Bug Fixes
+
+* **ci:** gate npm publish on GH release tag, not package.json push ([#15](https://github.com/studio-b-ai/clients/issues/15)) ([8a4712f](https://github.com/studio-b-ai/clients/commit/8a4712f285a50a5388b75e077c723239a487e06c))
+* **session-pool:** prevent orphan slot hashes — defensive TTL + reaper + withSession eviction guard (v1.2.0) ([#17](https://github.com/studio-b-ai/clients/issues/17)) ([cac4fd3](https://github.com/studio-b-ai/clients/commit/cac4fd344b2e77ba5ec22070cd720020528d2b50))
+
 ## 1.0.0 (2026-04-19)
 
 
