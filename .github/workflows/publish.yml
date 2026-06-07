@@ -43,10 +43,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # NOTE: no `registry-url` — setup-node's registry-url writes an .npmrc with
+      # `_authToken=${NODE_AUTH_TOKEN}` and sets NODE_AUTH_TOKEN to a placeholder
+      # (XXXXX-XXXXX-XXXXX-XXXXX). npm then sends that garbage token (→ E404) instead
+      # of doing the OIDC trusted-publishing exchange, which requires NO _authToken
+      # line in .npmrc. Default registry is registry.npmjs.org anyway.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: 'https://registry.npmjs.org'
 
       # OIDC trusted publishing requires npm >= 11.5.1; Node 22 runners ship npm 10.x.
       - name: Upgrade npm for OIDC trusted publishing
