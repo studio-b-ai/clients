@@ -24,6 +24,8 @@ export { SoapClient, loadTenantConfig, selectBolts } from './soap-client.js';
 export type { SoapClientConfig, SoapCommand, AllocateLotParams, AllocateLotResult, TenantConfig, TenantName, AvailableLot } from './soap-client.js';
 export { SessionPool, SessionPoolExhaustedError } from './session-pool.js';
 export type { PoolConfig, PoolEvent, PoolStatus, SessionHandle } from './session-pool.js';
+export { reapAllOrphanSlots } from './reap-orphans.js';
+export type { ReapAllOrphansOptions, ReapAllOrphansResult } from './reap-orphans.js';
 
 // -- Factory --
 
