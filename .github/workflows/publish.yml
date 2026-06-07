@@ -27,6 +27,12 @@ on:
 # more elegant, because GitHub suppresses workflow runs triggered by the
 # default GITHUB_TOKEN — and release-please uses GITHUB_TOKEN to create
 # releases. The push trigger is what actually fires reliably.
+#
+# AUTH: publishing uses GitHub OIDC **trusted publishing** — there is NO stored
+# NPM_TOKEN (the prior token-based flow silently broke when the token expired,
+# 2026-06). Configure the trusted publisher once on npmjs.org: package settings
+# → Trusted Publisher → GitHub Actions → org=studio-b-ai, repo=clients,
+# workflow=publish.yml, allowed action=npm publish. Nothing to rotate or expire.
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -41,6 +47,10 @@ jobs:
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
+
+      # OIDC trusted publishing requires npm >= 11.5.1; Node 22 runners ship npm 10.x.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
 
       - name: Check if version already published
         id: version_check
@@ -63,8 +73,8 @@ jobs:
         if: steps.version_check.outputs.already_published == 'false'
         run: npm run build
 
-      - name: Publish with provenance
+      # Auth via GitHub OIDC trusted publishing — no NPM_TOKEN. Provenance is
+      # attested automatically through the same OIDC identity.
+      - name: Publish with provenance (OIDC trusted publishing)
         if: steps.version_check.outputs.already_published == 'false'
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
