@@ -5,6 +5,18 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3](https://github.com/studio-b-ai/clients/compare/v1.1.2...v1.1.3) (2026-06-07)
+
+
+### Bug Fixes
+
+* **session-pool:** cross-prefix orphan sweep (reapAllOrphanSlots) for legacy/defunct-prefix zombie slots ([#21](https://github.com/studio-b-ai/clients/issues/21)) ([4679864](https://github.com/studio-b-ai/clients/commit/4679864436620ca949e59905b4bb222318e6b78c))
+
+
+### Reverts
+
+* **ci:** restore token-based publish (OIDC deferred, off critical path) ([#19](https://github.com/studio-b-ai/clients/issues/19)) ([299db1e](https://github.com/studio-b-ai/clients/commit/299db1ea144bf98fcb38875d5ea2997deb61dd70))
+
 ## [1.1.2](https://github.com/studio-b-ai/clients/compare/v1.1.1...v1.1.2) (2026-06-05)
 
 
