@@ -5,6 +5,13 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4](https://github.com/studio-b-ai/clients/compare/v1.1.3...v1.1.4) (2026-06-08)
+
+
+### Bug Fixes
+
+* **soap-client:** canonical NewRow + nested LinkedCommand for detail-row add ([#24](https://github.com/studio-b-ai/clients/issues/24)) ([ce56110](https://github.com/studio-b-ai/clients/commit/ce561102161b31277cd068a8f7c79280ae5367aa))
+
 ## [1.1.3](https://github.com/studio-b-ai/clients/compare/v1.1.2...v1.1.3) (2026-06-07)
 
 
