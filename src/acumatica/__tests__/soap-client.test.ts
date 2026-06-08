@@ -185,6 +185,80 @@ describe('SoapClient', () => {
       expect(opts.body).toContain('<Value>000123</Value>');
     });
 
+    it('emits NewRow + nested LinkedCommand Values for a detail-row add (Rule #309)', async () => {
+      // Login first to set cookies
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, LOGIN_SUCCESS_BODY, {
+          'set-cookie': '.ASPXAUTH=abc123; path=/',
+        }),
+      );
+      await client.login('SB501000');
+      vi.clearAllMocks();
+
+      mockRequest.mockResolvedValueOnce(mockResponse(200, SUBMIT_SUCCESS_BODY));
+
+      // Canonical Acumatica detail-line add: Key-nav the parent, NewRow on the
+      // detail view, then field Values BOUND via linkTo so they populate the
+      // NEW row instead of the grid's current (existing) row.
+      const commands: SoapCommand[] = [
+        { fieldName: 'ContainerCD', objectName: 'Containers', value: "='FSCU7219200'", type: 'Key' },
+        { fieldName: 'NewRow', objectName: 'POLinks', type: 'Action' },
+        { type: 'Value', value: 'RO', commit: true, linkTo: { objectName: 'POLinks', fieldName: 'OrderType' } },
+        { type: 'Value', value: 'PO000337', commit: true, linkTo: { objectName: 'POLinks', fieldName: 'OrderNbr' } },
+        { type: 'Value', value: '1', commit: true, linkTo: { objectName: 'POLinks', fieldName: 'LineNbr' } },
+        { fieldName: 'Save', objectName: 'Containers', type: 'Action' },
+      ];
+
+      await client.submit('SB501000', commands);
+
+      const [, opts] = mockRequest.mock.calls[0]!;
+      const body: string = opts.body;
+
+      // NewRow is an Action on the detail view.
+      expect(body).toMatch(
+        /<Command xsi:type="Action"[^>]*>\s*<FieldName>NewRow<\/FieldName>\s*<ObjectName>POLinks<\/ObjectName>/,
+      );
+      // Each bound Value emits a nested <LinkedCommand xsi:type="Field"> carrying
+      // the field reference — and NO top-level FieldName/ObjectName.
+      expect(body).toMatch(
+        /<Value>RO<\/Value>\s*<Commit>true<\/Commit>\s*<LinkedCommand xsi:type="Field"[^>]*>\s*<FieldName>OrderType<\/FieldName>\s*<ObjectName>POLinks<\/ObjectName>\s*<\/LinkedCommand>/,
+      );
+      expect(body).toContain('<FieldName>OrderNbr</FieldName>');
+      expect(body).toContain('<FieldName>LineNbr</FieldName>');
+      // CRITICAL (Rule #309): the OLD broken shape — a top-level
+      // FieldName/ObjectName Value on the POLinks grid — must NOT appear, or
+      // Acumatica resolves against the current row and UPDATES it.
+      expect(body).not.toMatch(
+        /<FieldName>OrderType<\/FieldName>\s*<ObjectName>POLinks<\/ObjectName>\s*<Value>RO<\/Value>/,
+      );
+    });
+
+    it('binds linkTo even when the caller omits type (xsi prefix stays scoped)', async () => {
+      // codex P2 regression guard: a linkTo command relying on the default
+      // (undefined) type must still emit an outer xsi:type so the nested
+      // <LinkedCommand xsi:type="Field"> prefix is bound — otherwise the SOAP
+      // parser rejects an unbound xsi prefix.
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, LOGIN_SUCCESS_BODY, { 'set-cookie': '.ASPXAUTH=abc123; path=/' }),
+      );
+      await client.login('SB501000');
+      vi.clearAllMocks();
+      mockRequest.mockResolvedValueOnce(mockResponse(200, SUBMIT_SUCCESS_BODY));
+
+      await client.submit('SB501000', [
+        { value: 'RO', commit: true, linkTo: { objectName: 'POLinks', fieldName: 'OrderType' } }, // no `type`
+      ]);
+
+      const [, opts] = mockRequest.mock.calls[0]!;
+      const body: string = opts.body;
+      // Outer Command gets xsi:type="Value" (derived) WITH xmlns:xsi bound.
+      expect(body).toContain('<Command xsi:type="Value" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">');
+      // Nested LinkedCommand also self-binds xmlns:xsi (defensive).
+      expect(body).toContain('<LinkedCommand xsi:type="Field" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">');
+      // No unbound `xsi:` usage inside a bare <Command> (the broken shape).
+      expect(body).not.toMatch(/<Command>\s*<Value>RO<\/Value>\s*<Commit>true<\/Commit>\s*<LinkedCommand xsi:type=/);
+    });
+
     it('throws on SOAP fault', async () => {
       // Login
       mockRequest.mockResolvedValueOnce(

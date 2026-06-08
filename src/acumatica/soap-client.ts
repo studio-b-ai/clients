@@ -45,16 +45,36 @@ export type SoapCommandType = 'Value' | 'Field' | 'Action' | 'Key';
 
 /** A single SOAP Screen API command (field set or action trigger). */
 export interface SoapCommand {
-  /** Field name on the screen (e.g. "OrderType", "OrderNbr"). */
-  fieldName: string;
-  /** Object/view name on the screen (e.g. "Document", "Transactions"). */
-  objectName: string;
+  /**
+   * Field name on the screen (e.g. "OrderType", "OrderNbr"). Optional only when
+   * `linkTo` is set — a LinkedCommand-bound Value carries its field reference
+   * inside `linkTo`, not at the top level (Acumatica detail-row-add wire).
+   */
+  fieldName?: string;
+  /** Object/view name on the screen (e.g. "Document", "Transactions"). Optional only when `linkTo` is set. */
+  objectName?: string;
   /** Value to set. Omit for actions like Save. */
   value?: string;
   /** When true, triggers server-side commit logic (like Tab in the UI). */
   commit?: boolean;
-  /** Linked command reference name (rarely needed). */
+  /** Linked command reference name (rarely needed; legacy flat form). */
   linkedCommand?: string;
+  /**
+   * Bind this Value to a detail-grid field via a nested <LinkedCommand>, so it
+   * targets the row created by a preceding NewRow ServiceCommand instead of the
+   * grid's current (first existing) row.
+   *
+   * REQUIRED for adding a row to a NON-EMPTY detail grid: a plain
+   * FieldName/ObjectName Value resolves against the grid's current row and
+   * UPDATES it instead of populating the new row (CLAUDE.md Rule #309 — verified
+   * live 2026-06-08: NewRow + FieldName/ObjectName Values left a 3-link grid at
+   * 3 links with the first row overwritten). The canonical Acumatica wire for a
+   * detail-line add is `NewRow` + `Value{ LinkedCommand = Detail.Field }`
+   * (Integration Development Guide, "Commands for Adding Detail Lines"). When
+   * `linkTo` is set the top-level FieldName/ObjectName are omitted — the nested
+   * <LinkedCommand> carries the field reference.
+   */
+  linkTo?: { objectName: string; fieldName: string };
   /** SOAP command type. Default: 'Value' for commands with value, 'Action' for Save/Delete/Cancel. */
   type?: SoapCommandType;
 }
@@ -123,7 +143,11 @@ function buildSubmitXml(commands: SoapCommand[]): string {
       // Using explicit types causes issues: Field=read-only, Value=creates-new,
       // Key=hangs. Omitting lets Acumatica handle it correctly.
       const xsiType = cmd.type
-        ?? (ACTION_FIELDS.has(cmd.fieldName) ? 'Action' : undefined);
+        ?? (cmd.linkTo
+          ? 'Value' // a linkTo command is a bound Value; force the outer xsi:type so the nested <LinkedCommand xsi:type=…> prefix is always scoped
+          : cmd.fieldName && ACTION_FIELDS.has(cmd.fieldName)
+            ? 'Action'
+            : undefined);
 
       const parts: string[] = [];
       if (xsiType) {
@@ -131,15 +155,38 @@ function buildSubmitXml(commands: SoapCommand[]): string {
       } else {
         parts.push(`      <Command>`);
       }
-      parts.push(`        <FieldName>${escapeXml(cmd.fieldName)}</FieldName>`);
-      parts.push(`        <ObjectName>${escapeXml(cmd.objectName)}</ObjectName>`);
+      // A LinkedCommand-bound Value carries its field reference INSIDE the
+      // nested <LinkedCommand> — emitting a top-level FieldName/ObjectName
+      // alongside it makes Acumatica resolve against the grid's current row
+      // (the Rule #309 update-not-insert bug). So when `linkTo` is set, omit
+      // the top-level FieldName/ObjectName. Otherwise keep the existing wire
+      // byte-for-byte (every current caller sets fieldName + objectName).
+      if (!cmd.linkTo) {
+        if (cmd.fieldName !== undefined) {
+          parts.push(`        <FieldName>${escapeXml(cmd.fieldName)}</FieldName>`);
+        }
+        if (cmd.objectName !== undefined) {
+          parts.push(`        <ObjectName>${escapeXml(cmd.objectName)}</ObjectName>`);
+        }
+      }
       if (cmd.value !== undefined) {
         parts.push(`        <Value>${escapeXml(cmd.value)}</Value>`);
       }
       if (cmd.commit) {
         parts.push(`        <Commit>true</Commit>`);
       }
-      if (cmd.linkedCommand) {
+      if (cmd.linkTo) {
+        // Nested Field command — the canonical Acumatica wire for binding a
+        // Value to a specific detail field on the row created by a preceding
+        // NewRow ServiceCommand (IDG "Commands for Adding Detail Lines").
+        // Self-bind xmlns:xsi on the nested element so the xsi:type prefix is
+        // always scoped, even if the outer <Command> emitted none (defensive —
+        // outer xsi:type is also forced to 'Value' above for linkTo commands).
+        parts.push(`        <LinkedCommand xsi:type="Field" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">`);
+        parts.push(`          <FieldName>${escapeXml(cmd.linkTo.fieldName)}</FieldName>`);
+        parts.push(`          <ObjectName>${escapeXml(cmd.linkTo.objectName)}</ObjectName>`);
+        parts.push(`        </LinkedCommand>`);
+      } else if (cmd.linkedCommand) {
         parts.push(`        <LinkedCommand>${escapeXml(cmd.linkedCommand)}</LinkedCommand>`);
       }
       parts.push(`      </Command>`);
@@ -165,8 +212,11 @@ function buildExportXml(commands: SoapCommand[], topCount: number): string {
       const xsiType = cmd.type ?? (cmd.value !== undefined ? 'Value' : 'Field');
       const parts: string[] = [];
       parts.push(`        <tns:Command xsi:type="tns:${xsiType}">`);
-      parts.push(`          <tns:FieldName>${escapeXml(cmd.fieldName)}</tns:FieldName>`);
-      parts.push(`          <tns:ObjectName>${escapeXml(cmd.objectName)}</tns:ObjectName>`);
+      // Export commands always carry fieldName/objectName (the `linkTo` detail-
+      // add path is Submit-only and never reaches buildExportXml); `?? ''` only
+      // satisfies the now-optional types.
+      parts.push(`          <tns:FieldName>${escapeXml(cmd.fieldName ?? '')}</tns:FieldName>`);
+      parts.push(`          <tns:ObjectName>${escapeXml(cmd.objectName ?? '')}</tns:ObjectName>`);
       if (cmd.value !== undefined) {
         parts.push(`          <tns:Value>${escapeXml(cmd.value)}</tns:Value>`);
       }
