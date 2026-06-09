@@ -5,6 +5,13 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1](https://github.com/studio-b-ai/clients/compare/v1.2.0...v1.2.1) (2026-06-09)
+
+
+### Bug Fixes
+
+* **acm-pool:** converge no-op — decouple from ping + bound pingSession timeout ([#28](https://github.com/studio-b-ai/clients/issues/28)) ([d821bbf](https://github.com/studio-b-ai/clients/commit/d821bbf6c97da679da94fad8ec53bd9594d1066c))
+
 ## [1.2.0](https://github.com/studio-b-ai/clients/compare/v1.1.4...v1.2.0) (2026-06-09)
 
 
