@@ -5,6 +5,13 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0](https://github.com/studio-b-ai/clients/compare/v1.1.4...v1.2.0) (2026-06-09)
+
+
+### Features
+
+* **acm-pool:** converge idle pool slots down to maxSize (opt-in) ([#26](https://github.com/studio-b-ai/clients/issues/26)) ([baa60ed](https://github.com/studio-b-ai/clients/commit/baa60edaf701041fb64f960b5f68f9f33182275a))
+
 ## [1.1.4](https://github.com/studio-b-ai/clients/compare/v1.1.3...v1.1.4) (2026-06-08)
 
 
