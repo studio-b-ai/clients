@@ -273,4 +273,51 @@ describeRedis('SessionPool (Redis integration)', () => {
 
     await pool.checkin(h2);
   });
+
+  it('convergeIdleToMaxSize sheds excess idle slots via EVICT_IDLE_LUA down to maxSize', async () => {
+    // Exercises the REAL Redis EVICT_IDLE_LUA converge path. The unit suite only
+    // covered the degraded/localSlots path — that gap is exactly what let the
+    // 2026-06-09 prod converge bug ship undetected. checkout() caps at maxSize, so
+    // seed the >maxSize state directly into Redis under the pool's real key prefix.
+    const pool = trackAccount(makePool({ maxSize: 2, keepaliveMs: 50, convergeIdleToMaxSize: true }));
+    pool._setPingFn(vi.fn().mockResolvedValue(undefined)); // ping success → no 401 eviction
+    const logoutMock = vi.fn().mockResolvedValue(undefined);
+    pool._setLogoutFn(logoutMock);
+
+    // Warm the pool's Redis connection before keepalive fires. enableOfflineQueue is
+    // false, so a command issued before the socket is 'ready' degrades the pool and
+    // skips the Redis converge path. In prod the pool is always warm — this only
+    // matters for a freshly-constructed test pool whose first tick races the connect.
+    const poolRedis = (pool as unknown as { getRedis(): Redis | null }).getRedis();
+    if (poolRedis && poolRedis.status !== 'ready') {
+      await new Promise<void>((resolve) => poolRedis.once('ready', () => resolve()));
+    }
+
+    const slotsKey = `${pool.keyPrefix}:slots`;
+    const now = String(Date.now());
+    const slotHashKeys: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const sid = `slot-${i}`;
+      const hk = `${pool.keyPrefix}:slot:${sid}`;
+      slotHashKeys.push(hk);
+      await cleanupRedis.sadd(slotsKey, sid);
+      await cleanupRedis.hset(hk, {
+        cookie: `.ASPXAUTH=cookie-${i}`,
+        createdAt: now,
+        lastUsedAt: now,
+        checkedOutBy: '',
+        checkedOutAt: '0',
+      });
+    }
+    expect(await cleanupRedis.scard(slotsKey)).toBe(5);
+
+    pool.startKeepalive();
+    await new Promise((r) => setTimeout(r, 250));
+    pool.stopKeepalive();
+
+    expect(await cleanupRedis.scard(slotsKey)).toBe(2); // converged via EVICT_IDLE_LUA
+    expect(logoutMock).toHaveBeenCalledTimes(3); // 3 excess sessions logged out
+
+    await cleanupRedis.del(slotsKey, ...slotHashKeys); // explicit cleanup (afterEach keys on account)
+  });
 });

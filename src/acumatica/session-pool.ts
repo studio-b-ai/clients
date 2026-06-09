@@ -412,21 +412,25 @@ export class SessionPool {
   startKeepalive(): void {
     if (this.keepaliveTimer) return;
     this.keepaliveTimer = setInterval(() => {
-      // Ping idle sessions + reap orphans, THEN shed excess idle slots to maxSize.
-      // Each step is independently fail-open so neither can stall the other or
-      // crash the timer. Convergence is a no-op unless convergeIdleToMaxSize is set.
-      void (async () => {
-        try {
-          await this.pingIdleSlots();
-        } catch (err) {
-          this.log.warn({ err: (err as Error).message }, 'Keepalive ping cycle failed');
-        }
-        try {
-          await this.convergeIdleSlots();
-        } catch (err) {
-          this.log.warn({ err: (err as Error).message }, 'Keepalive converge cycle failed');
-        }
-      })();
+      // Ping idle sessions (+ reap orphans) AND shed excess idle slots to maxSize
+      // as INDEPENDENT tasks — neither awaits the other. This decoupling is
+      // load-bearing: pingIdleSlots awaits a network ping per idle slot, and under
+      // an Acumatica Sign-In-limit throttle (Rule #311) that ping can be slow or
+      // hang. Running them sequentially (ping THEN converge) let a slow/hung ping
+      // starve convergeIdleSlots, so the pool never shed back to maxSize (2026-06-09
+      // prod: stuck at 5 idle sessions vs maxSize 4 for 23 days). Decoupled, converge
+      // runs every cycle regardless of ping latency. Safe to run concurrently:
+      // EVICT_IDLE_LUA re-guards SCARD>maxSize atomically per evict and the degraded
+      // path re-checks localSlots.size each iteration, so a concurrent ping eviction
+      // can never make converge shed below maxSize; JS Map deletion during iteration
+      // is well-defined. Each task is independently fail-open. Convergence is a no-op
+      // unless convergeIdleToMaxSize is set.
+      void this.pingIdleSlots().catch((err) => {
+        this.log.warn({ err: (err as Error).message }, 'Keepalive ping cycle failed');
+      });
+      void this.convergeIdleSlots().catch((err) => {
+        this.log.warn({ err: (err as Error).message }, 'Keepalive converge cycle failed');
+      });
     }, this.keepaliveMs);
     this.keepaliveTimer.unref();
     this.log.debug({ intervalMs: this.keepaliveMs }, 'Keepalive started');
@@ -559,9 +563,17 @@ export class SessionPool {
     if (this.pingFn) return this.pingFn(cookie);
 
     const baseUrl = this.credentials.baseUrl.replace(/\/$/, '');
+    // Bounded (8s) — same as logoutSession. The ping hits /entity/auth/login,
+    // the AUTH endpoint, which is exactly what an Acumatica Sign-In-limit
+    // throttle chokes (Rule #311). Without a timeout, a throttled ping HANGS
+    // indefinitely; since pingIdleSlots awaits each ping in turn, a single hung
+    // ping would stall the whole keepalive cycle. The timeout surfaces it as a
+    // normal (non-401) error so the slot is left intact and the cycle proceeds.
     const res = await undiciRequest(`${baseUrl}/entity/auth/login`, {
       method: 'GET',
       headers: { Cookie: cookie },
+      headersTimeout: 8_000,
+      bodyTimeout: 8_000,
     });
     await res.body.text(); // Drain body
     if (res.statusCode === 401) {
@@ -618,12 +630,14 @@ export class SessionPool {
     // --- Degraded mode (no Redis): shed excess idle local slots ---
     if (!redis || this.degraded) {
       if (this.localSlots.size <= this.maxSize) return;
+      let evicted = 0;
       for (const [sid, slot] of this.localSlots) {
         // Re-check the LIVE size each iteration so a concurrent 401-eviction in
         // this process can never make us shed below maxSize (codex P2, degraded path).
         if (this.localSlots.size <= this.maxSize) break;
         if (slot.checkedOutBy !== '') continue; // never evict a checked-out slot
         this.localSlots.delete(sid); // evict first — slot is gone even if logout fails
+        evicted++;
         this.emit('slot_evicted', `Converge: shed excess idle slot ${sid} (degraded)`);
         try {
           await this.logoutSession(slot.cookie);
@@ -633,6 +647,12 @@ export class SessionPool {
             'Converge logout failed (slot already evicted)',
           );
         }
+      }
+      if (evicted > 0) {
+        this.log.info(
+          { account: this.account, evicted, maxSize: this.maxSize, degraded: true },
+          'Converge: shed excess idle pool slots down to maxSize',
+        );
       }
       return;
     }
@@ -647,6 +667,7 @@ export class SessionPool {
     }
     if (slotIds.length <= this.maxSize) return; // cheap pre-check; the Lua re-guards atomically per evict
 
+    let evicted = 0;
     for (const sid of slotIds) {
       let res: unknown;
       try {
@@ -672,6 +693,7 @@ export class SessionPool {
       if (typeof res === 'number') break; // -1: pool reached maxSize — stop the sweep
       if (res === null || res === undefined) continue; // checked out — skip, keep sweeping
       const cookie = res as string; // evicted (cookie may be '')
+      evicted++;
       this.emit('slot_evicted', `Converge: shed excess idle slot ${sid}`);
       if (cookie) {
         try {
@@ -683,6 +705,12 @@ export class SessionPool {
           );
         }
       }
+    }
+    if (evicted > 0) {
+      this.log.info(
+        { account: this.account, evicted, maxSize: this.maxSize },
+        'Converge: shed excess idle pool slots down to maxSize',
+      );
     }
   }
 

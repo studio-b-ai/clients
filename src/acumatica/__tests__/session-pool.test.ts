@@ -465,6 +465,28 @@ describe('SessionPool', () => {
 
       expect(events.filter((e) => e.type === 'slot_evicted')).toHaveLength(1);
     });
+
+    it('still sheds excess idle slots when pingIdleSlots hangs (converge decoupled from ping)', async () => {
+      // Reproduces the 2026-06-09 prod bug: a hung auth-endpoint ping (Acumatica
+      // Sign-In-limit throttle, Rule #311) must NOT starve convergeIdleSlots. The
+      // pingFn never resolves; under the old sequential ping-THEN-converge cycle this
+      // left the pool stuck above maxSize forever (prod: 5 idle vs maxSize 4 for 23d).
+      // Decoupled, converge still runs every cycle and sheds.
+      const pool = makePool({ maxSize: 2, keepaliveMs: 50, convergeIdleToMaxSize: true });
+      pool._setPingFn(vi.fn(() => new Promise<void>(() => {}))); // hangs forever
+      const logoutMock = vi.fn().mockResolvedValue(undefined);
+      pool._setLogoutFn(logoutMock);
+
+      for (let i = 0; i < 5; i++) seedIdleLocalSlot(pool, `slot-${i}`, `.ASPXAUTH=cookie${i}`);
+      expect(localSize(pool)).toBe(5);
+
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 200));
+      pool.stopKeepalive();
+
+      expect(localSize(pool)).toBe(2); // converged to maxSize despite the hung ping
+      expect(logoutMock).toHaveBeenCalledTimes(3);
+    });
   });
 
   describe('onEvent', () => {
