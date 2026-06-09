@@ -4,6 +4,7 @@ import {
   poolKeyPrefix,
   poolLockoutKey,
   type SessionHandle,
+  type PoolEvent,
 } from '../session-pool.js';
 import { AccountLockedError } from '../error-handler.js';
 
@@ -20,6 +21,24 @@ function makePool(overrides: Partial<ConstructorParameters<typeof SessionPool>[0
     redisUrl: '',
     serviceId: 'test-service',
     ...overrides,
+  });
+}
+
+/**
+ * Seed an idle (or checked-out) local slot directly, simulating EXCESS slots
+ * that exist above maxSize — e.g. inherited from a peak before maxSize was
+ * lowered, or created cross-process on a shared Redis set. checkout() would
+ * backpressure at maxSize, so direct seeding is the only way to construct the
+ * "more live slots than maxSize" state convergence is built to drain.
+ */
+function seedIdleLocalSlot(pool: SessionPool, id: string, cookie: string, checkedOutBy = ''): void {
+  (pool as unknown as {
+    localSlots: Map<string, { cookie: string; checkedOutBy: string; checkedOutAt: number; createdAt: number }>;
+  }).localSlots.set(id, {
+    cookie,
+    checkedOutBy,
+    checkedOutAt: checkedOutBy ? Date.now() : 0,
+    createdAt: Date.now(),
   });
 }
 
@@ -332,6 +351,119 @@ describe('SessionPool', () => {
       pool.stopKeepalive();
 
       expect(pingMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('convergeIdleToMaxSize (shed excess idle slots)', () => {
+    function localSize(pool: SessionPool): number {
+      return (pool as unknown as { localSlots: Map<string, unknown> }).localSlots.size;
+    }
+
+    it('sheds excess idle slots down to maxSize and logs each out', async () => {
+      const pool = makePool({ maxSize: 2, keepaliveMs: 50, convergeIdleToMaxSize: true });
+      pool._setPingFn(vi.fn().mockResolvedValue(undefined)); // ping success → no 401 eviction
+      const logoutMock = vi.fn().mockResolvedValue(undefined);
+      pool._setLogoutFn(logoutMock);
+
+      for (let i = 0; i < 5; i++) seedIdleLocalSlot(pool, `slot-${i}`, `.ASPXAUTH=cookie${i}`);
+      expect(localSize(pool)).toBe(5);
+
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 150));
+      pool.stopKeepalive();
+
+      expect(localSize(pool)).toBe(2); // converged to maxSize
+      expect(logoutMock).toHaveBeenCalledTimes(3); // 3 excess sessions logged out
+    });
+
+    it('never evicts a checked-out slot', async () => {
+      const pool = makePool({ maxSize: 2, keepaliveMs: 50, convergeIdleToMaxSize: true });
+      pool._setPingFn(vi.fn().mockResolvedValue(undefined));
+      const logoutMock = vi.fn().mockResolvedValue(undefined);
+      pool._setLogoutFn(logoutMock);
+
+      seedIdleLocalSlot(pool, 'busy', '.ASPXAUTH=busy', 'in-use'); // checked out
+      seedIdleLocalSlot(pool, 'idle-1', '.ASPXAUTH=i1');
+      seedIdleLocalSlot(pool, 'idle-2', '.ASPXAUTH=i2');
+      seedIdleLocalSlot(pool, 'idle-3', '.ASPXAUTH=i3'); // 4 slots, excess = 2
+
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 150));
+      pool.stopKeepalive();
+
+      const slots = (pool as unknown as { localSlots: Map<string, unknown> }).localSlots;
+      expect(slots.has('busy')).toBe(true); // checked-out slot survives
+      expect(slots.size).toBe(2); // shed 2 of the 3 idle
+      expect(logoutMock).toHaveBeenCalledTimes(2); // only idle slots logged out
+    });
+
+    it('is a no-op when the flag is off', async () => {
+      const pool = makePool({ maxSize: 2, keepaliveMs: 50 }); // convergeIdleToMaxSize default false
+      pool._setPingFn(vi.fn().mockResolvedValue(undefined));
+      const logoutMock = vi.fn().mockResolvedValue(undefined);
+      pool._setLogoutFn(logoutMock);
+
+      for (let i = 0; i < 5; i++) seedIdleLocalSlot(pool, `slot-${i}`, `.ASPXAUTH=cookie${i}`);
+
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 150));
+      pool.stopKeepalive();
+
+      expect(localSize(pool)).toBe(5); // untouched
+      expect(logoutMock).not.toHaveBeenCalled();
+    });
+
+    it('is a no-op when slot count is at or under maxSize', async () => {
+      const pool = makePool({ maxSize: 5, keepaliveMs: 50, convergeIdleToMaxSize: true });
+      pool._setPingFn(vi.fn().mockResolvedValue(undefined));
+      const logoutMock = vi.fn().mockResolvedValue(undefined);
+      pool._setLogoutFn(logoutMock);
+
+      for (let i = 0; i < 3; i++) seedIdleLocalSlot(pool, `slot-${i}`, `.ASPXAUTH=cookie${i}`);
+
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 150));
+      pool.stopKeepalive();
+
+      expect(localSize(pool)).toBe(3);
+      expect(logoutMock).not.toHaveBeenCalled();
+    });
+
+    it('still evicts when the logout call fails (fail-open)', async () => {
+      const pool = makePool({ maxSize: 2, keepaliveMs: 50, convergeIdleToMaxSize: true });
+      pool._setPingFn(vi.fn().mockResolvedValue(undefined));
+      const logoutMock = vi.fn().mockRejectedValue(new Error('logout 500'));
+      pool._setLogoutFn(logoutMock);
+
+      for (let i = 0; i < 4; i++) seedIdleLocalSlot(pool, `slot-${i}`, `.ASPXAUTH=cookie${i}`);
+
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 150));
+      pool.stopKeepalive();
+
+      expect(localSize(pool)).toBe(2); // slots evicted despite logout failure
+      expect(logoutMock).toHaveBeenCalledTimes(2); // logout was attempted
+    });
+
+    it('emits slot_evicted for each shed slot', async () => {
+      const events: PoolEvent[] = [];
+      const pool = makePool({
+        maxSize: 1,
+        keepaliveMs: 50,
+        convergeIdleToMaxSize: true,
+        onEvent: (e) => events.push(e),
+      });
+      pool._setPingFn(vi.fn().mockResolvedValue(undefined));
+      pool._setLogoutFn(vi.fn().mockResolvedValue(undefined));
+
+      seedIdleLocalSlot(pool, 'a', '.ASPXAUTH=a');
+      seedIdleLocalSlot(pool, 'b', '.ASPXAUTH=b'); // excess = 1
+
+      pool.startKeepalive();
+      await new Promise((r) => setTimeout(r, 150));
+      pool.stopKeepalive();
+
+      expect(events.filter((e) => e.type === 'slot_evicted')).toHaveLength(1);
     });
   });
 
