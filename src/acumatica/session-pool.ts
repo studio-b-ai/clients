@@ -86,6 +86,26 @@ export interface PoolConfig {
    * Set to 0 to disable (not recommended for production).
    */
   slotTtlMs?: number;
+  /**
+   * When true, the keepalive cycle sheds EXCESS IDLE slots so the live session
+   * count converges DOWN to maxSize: each excess idle slot is atomically
+   * evicted (idle-only) AND logged out Acumatica-side, immediately returning the
+   * concurrent-API-login seat. Default false.
+   *
+   * Why this exists: maxSize only gates NEW slot creation; idle slots are only
+   * ever evicted on a 401, and keepalive PREVENTS the 401 by pinging them alive.
+   * So a pool that once peaked at N slots (e.g. before maxSize was lowered, or a
+   * load spike) keeps N live sessions FOREVER, even above maxSize — a permanent
+   * draw on the per-account concurrent-login cap (CLAUDE.md Rule #311).
+   *
+   * ⚠️ SHARED-PREFIX INVARIANT: pools sharing a (baseUrl, account, company) Redis
+   * slot set MUST enable this on AT MOST ONE pool, and it must be the pool with
+   * the LARGEST maxSize. A smaller-maxSize co-pool with convergence enabled would
+   * shed slots the larger pool still needs → login thrash. Enable ONLY on the
+   * primary (largest) pool — e.g. the studiob-api gateway pool — NEVER on a
+   * co-pool like the MCP pool (which runs a smaller maxSize on the same prefix).
+   */
+  convergeIdleToMaxSize?: boolean;
   /** Optional event callback for observability (Slack alerts, metrics) */
   onEvent?: (event: PoolEvent) => void;
   /** Logger instance */
@@ -264,6 +284,36 @@ const EVICT_SLOT_LUA = `
   return 1
 `;
 
+/**
+ * EVICT_IDLE_LUA: Atomically evict ONE slot for convergence, guarded by BOTH the
+ * live pool size AND the slot's checkout state — both read inside the same Lua so
+ * there is no TOCTOU. This makes convergence safe even when multiple processes
+ * (e.g. two gateway replicas during a deploy) run it on a shared slot set, or a
+ * 401-eviction races it: the SCARD>maxSize gate means the pool can never be shed
+ * BELOW maxSize, so valid warm sessions are never over-logged-out (codex P2).
+ * KEYS[1] = slotsKey, KEYS[2] = slotKey, ARGV[1] = slotId, ARGV[2] = maxSize
+ * Returns (distinct JS types, no collision):
+ *   -1 (number)           → pool already at/under maxSize; caller STOPs the sweep.
+ *   cookie / '' (string)  → slot evicted; cookie to log out ('' if it had none).
+ *   false (→ JS null)     → slot is checked out; skip it, keep sweeping.
+ */
+const EVICT_IDLE_LUA = `
+  local slotsKey = KEYS[1]
+  local sk = KEYS[2]
+  local maxSize = tonumber(ARGV[2])
+  if redis.call('SCARD', slotsKey) <= maxSize then
+    return -1
+  end
+  local checkedOutBy = redis.call('HGET', sk, 'checkedOutBy')
+  if checkedOutBy == '' or checkedOutBy == false then
+    local cookie = redis.call('HGET', sk, 'cookie')
+    redis.call('SREM', slotsKey, ARGV[1])
+    redis.call('DEL', sk)
+    return cookie or ''
+  end
+  return false
+`;
+
 // -- SessionPool --
 
 export class SessionPool {
@@ -275,6 +325,8 @@ export class SessionPool {
   readonly keepaliveMs: number;
   /** Defensive TTL on slot hashes in milliseconds. 0 = disabled. */
   readonly slotTtlMs: number;
+  /** When true, keepalive sheds excess idle slots down to maxSize (logout + evict). */
+  readonly convergeIdleToMaxSize: boolean;
 
   private credentials: PoolConfig['credentials'];
   private redisUrl: string;
@@ -302,6 +354,8 @@ export class SessionPool {
   private loginFn: (() => Promise<string>) | null = null;
   /** Test hook to replace the keepalive ping */
   private pingFn: ((cookie: string) => Promise<void>) | null = null;
+  /** Test hook to replace the HTTP logout call */
+  private logoutFn: ((cookie: string) => Promise<void>) | null = null;
   /** Keepalive timer handle */
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   /** Optional event callback */
@@ -318,6 +372,7 @@ export class SessionPool {
     this.pollIntervalMs = config.pollIntervalMs ?? 2_000;
     this.keepaliveMs = config.keepaliveMs ?? 600_000;
     this.slotTtlMs = config.slotTtlMs ?? 7_200_000; // 2h default
+    this.convergeIdleToMaxSize = config.convergeIdleToMaxSize ?? false;
     this.log = config.logger ?? pino({ name: `session-pool:${config.account}` });
     this.keyPrefix = poolKeyPrefix(
       config.credentials.baseUrl,
@@ -348,13 +403,30 @@ export class SessionPool {
     this.pingFn = fn;
   }
 
+  /** Test hook: replace HTTP logout with a mock function */
+  _setLogoutFn(fn: (cookie: string) => Promise<void>): void {
+    this.logoutFn = fn;
+  }
+
   /** Start background keepalive that pings idle sessions to prevent TTL expiry */
   startKeepalive(): void {
     if (this.keepaliveTimer) return;
     this.keepaliveTimer = setInterval(() => {
-      this.pingIdleSlots().catch((err) => {
-        this.log.warn({ err: (err as Error).message }, 'Keepalive ping cycle failed');
-      });
+      // Ping idle sessions + reap orphans, THEN shed excess idle slots to maxSize.
+      // Each step is independently fail-open so neither can stall the other or
+      // crash the timer. Convergence is a no-op unless convergeIdleToMaxSize is set.
+      void (async () => {
+        try {
+          await this.pingIdleSlots();
+        } catch (err) {
+          this.log.warn({ err: (err as Error).message }, 'Keepalive ping cycle failed');
+        }
+        try {
+          await this.convergeIdleSlots();
+        } catch (err) {
+          this.log.warn({ err: (err as Error).message }, 'Keepalive converge cycle failed');
+        }
+      })();
     }, this.keepaliveMs);
     this.keepaliveTimer.unref();
     this.log.debug({ intervalMs: this.keepaliveMs }, 'Keepalive started');
@@ -494,6 +566,123 @@ export class SessionPool {
     await res.body.text(); // Drain body
     if (res.statusCode === 401) {
       throw Object.assign(new Error('Session expired'), { statusCode: 401 });
+    }
+  }
+
+  /**
+   * Log an Acumatica session out server-side, freeing its concurrent-API-login
+   * seat IMMEDIATELY instead of waiting ~20-30 min for the session to time out.
+   * Bounded (8s) so a hung logout cannot stall the keepalive cycle. Callers run
+   * this best-effort AFTER the slot is already evicted, so a failure here only
+   * means the seat self-clears on Acumatica's own timeout — no worse than before.
+   */
+  private async logoutSession(cookie: string): Promise<void> {
+    if (this.logoutFn) return this.logoutFn(cookie);
+    if (!cookie) return;
+
+    const baseUrl = this.credentials.baseUrl.replace(/\/$/, '');
+    const res = await undiciRequest(`${baseUrl}/entity/auth/logout`, {
+      method: 'POST',
+      headers: { Cookie: cookie },
+      headersTimeout: 8_000,
+      bodyTimeout: 8_000,
+    });
+    await res.body.text(); // Drain body
+  }
+
+  /**
+   * Shed EXCESS IDLE slots so the live session count converges DOWN to maxSize.
+   * Opt-in via `convergeIdleToMaxSize`; runs at the end of each keepalive cycle.
+   *
+   * Why: maxSize only gates NEW slot creation, and idle slots are only ever
+   * evicted on a 401 — which keepalive actively prevents by pinging them alive.
+   * So a pool that once peaked above maxSize holds those extra live sessions
+   * forever, a permanent draw on the per-account login cap (Rule #311). This
+   * sheds the excess.
+   *
+   * Each excess idle slot is evicted FIRST (atomically, idle-only) then logged
+   * out — so the slot is gone regardless of whether the logout succeeds (a failed
+   * logout just falls back to Acumatica's timeout, the pre-convergence behaviour).
+   * Checked-out slots are never touched. Fail-open throughout: never throws into
+   * the keepalive timer.
+   *
+   * Safe on a slot set shared across processes: the Redis path uses an atomic
+   * evict-if-idle (EVICT_IDLE_LUA), so a slot another process checked out between
+   * our SMEMBERS read and the evict is skipped, never yanked out from under it.
+   */
+  private async convergeIdleSlots(): Promise<void> {
+    if (!this.convergeIdleToMaxSize) return;
+
+    const redis = this.getRedis();
+
+    // --- Degraded mode (no Redis): shed excess idle local slots ---
+    if (!redis || this.degraded) {
+      if (this.localSlots.size <= this.maxSize) return;
+      for (const [sid, slot] of this.localSlots) {
+        // Re-check the LIVE size each iteration so a concurrent 401-eviction in
+        // this process can never make us shed below maxSize (codex P2, degraded path).
+        if (this.localSlots.size <= this.maxSize) break;
+        if (slot.checkedOutBy !== '') continue; // never evict a checked-out slot
+        this.localSlots.delete(sid); // evict first — slot is gone even if logout fails
+        this.emit('slot_evicted', `Converge: shed excess idle slot ${sid} (degraded)`);
+        try {
+          await this.logoutSession(slot.cookie);
+        } catch (err) {
+          this.log.debug(
+            { slotId: sid, err: (err as Error).message },
+            'Converge logout failed (slot already evicted)',
+          );
+        }
+      }
+      return;
+    }
+
+    // --- Redis mode: atomic evict-if-idle per excess slot, then logout ---
+    let slotIds: string[];
+    try {
+      slotIds = await redis.smembers(slotsKey(this.keyPrefix));
+    } catch (err) {
+      if (this.isRedisConnectionError(err)) this.degraded = true;
+      return;
+    }
+    if (slotIds.length <= this.maxSize) return; // cheap pre-check; the Lua re-guards atomically per evict
+
+    for (const sid of slotIds) {
+      let res: unknown;
+      try {
+        res = await redis.eval(
+          EVICT_IDLE_LUA,
+          2,
+          slotsKey(this.keyPrefix),
+          slotKey(this.keyPrefix, sid),
+          sid,
+          String(this.maxSize),
+        );
+      } catch (err) {
+        if (this.isRedisConnectionError(err)) {
+          this.degraded = true;
+          return;
+        }
+        this.log.debug(
+          { slotId: sid, err: (err as Error).message },
+          'Converge evict-if-idle eval failed',
+        );
+        continue;
+      }
+      if (typeof res === 'number') break; // -1: pool reached maxSize — stop the sweep
+      if (res === null || res === undefined) continue; // checked out — skip, keep sweeping
+      const cookie = res as string; // evicted (cookie may be '')
+      this.emit('slot_evicted', `Converge: shed excess idle slot ${sid}`);
+      if (cookie) {
+        try {
+          await this.logoutSession(cookie);
+        } catch (err) {
+          this.log.debug(
+            { slotId: sid, err: (err as Error).message },
+            'Converge logout failed (slot already evicted)',
+          );
+        }
+      }
     }
   }
 
