@@ -32,7 +32,6 @@ jobs:
 
       - name: Typecheck
         run: npx tsc --noEmit
-        continue-on-error: true
 
       - name: Build
         run: npm run build
@@ -40,8 +39,7 @@ jobs:
       - name: Unit tests
         run: npm test
 
-      - name: Integration tests (pre-existing flaky, non-blocking)
-        continue-on-error: true
+      - name: Integration tests
         run: npm run test:integration
         env:
           REDIS_URL: redis://localhost:6379
