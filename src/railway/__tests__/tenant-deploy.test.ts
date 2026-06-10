@@ -27,7 +27,9 @@ const CLIENT_SOURCE = readFileSync(resolve(__dirname, '../client.ts'), 'utf8');
 
 function mockFetch(responses: Array<Record<string, unknown>>) {
   let i = 0;
-  return vi.fn(async () => {
+  // Typed as `typeof fetch` so `mock.calls[0]` is a real parameter tuple —
+  // every `calls[0]![1] as RequestInit` body assertion below depends on it.
+  return vi.fn<typeof fetch>(async () => {
     const r = responses[i++];
     return { ok: true, json: async () => r } as Response;
   });

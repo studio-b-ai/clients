@@ -81,7 +81,7 @@ describe('value-wrapper', () => {
     it('handles nested objects (sub-entities)', () => {
       const result = wrap({
         MainContact: { Email: 'test@test.com' },
-      });
+      }) as Record<string, unknown>;
       expect(result.MainContact).toBeDefined();
     });
   });

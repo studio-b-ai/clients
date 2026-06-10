@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, type Mock } from 'vitest';
 import {
   gatedQuery,
   getCustomerFull,
@@ -7,6 +7,7 @@ import {
   batchGetByFilter,
   setEntityAttribute,
 } from '../recipes.js';
+import type { Lease, SessionGate } from '../session-gate.js';
 
 // --- Mock factories ---
 
@@ -19,9 +20,16 @@ function mockClient() {
   };
 }
 
+const FAKE_LEASE: Lease = { id: 'lease-test', acquiredAt: 0, expiresAt: 0, degraded: false };
+
+// vi.fn() erases the generic <T> of withSession to `unknown`, so the inferred
+// Mock type can't satisfy SessionGate['withSession']. Cast to the real generic
+// signature intersected with Mock: callers see the proper type, tests keep
+// spy assertions. Runtime behavior is the vi.fn impl unchanged.
 function mockGate() {
   return {
-    withSession: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    withSession: vi.fn(async <T>(fn: (lease: Lease) => Promise<T>) => fn(FAKE_LEASE)) as
+      SessionGate['withSession'] & Mock,
   };
 }
 

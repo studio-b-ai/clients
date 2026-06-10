@@ -17,7 +17,9 @@ describe('expand-guard', () => {
     });
 
     it('returns empty for undefined input', () => {
-      const result = guardListExpand(undefined);
+      // Callers may pass undefined at runtime despite the `string` signature —
+      // pin the runtime contract without widening the production type.
+      const result = guardListExpand(undefined as unknown as string);
       expect(result.safeExpand).toBe('');
     });
   });
