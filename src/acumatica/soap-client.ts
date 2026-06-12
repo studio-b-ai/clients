@@ -256,19 +256,33 @@ function escapeXml(str: string): string {
     .replace(/'/g, '&apos;');
 }
 
+/**
+ * Extract positional <string> values from an ArrayOfString block.
+ *
+ * Acumatica emits empty fields as self-closing `<string />` — each must hold
+ * its position as '' or every subsequent column shifts left and header[j]
+ * pairs with the wrong value (live-confirmed on SB501000, 2026-06-12).
+ */
+function extractStrings(block: string): string[] {
+  const out: string[] = [];
+  const re = /<string(?:\s*\/>|>([^<]*)<\/string>)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(block)) !== null) out.push(m[1] ?? '');
+  return out;
+}
+
 /** Parse SOAP Export response into array of keyed objects. Row 0 = headers. */
 function parseExportResponse(xml: string): Record<string, string>[] {
   const arrayMatches = xml.match(/<ArrayOfString>([\s\S]*?)<\/ArrayOfString>/g);
   if (!arrayMatches || arrayMatches.length < 2) return [];
 
-  const headerMatch = arrayMatches[0]!.match(/<string>([^<]*)<\/string>/g);
-  const headers = headerMatch?.map((m) => m.replace(/<\/?string>/g, '')) ?? [];
-  if (headers.length === 0) return [];
+  const headers = extractStrings(arrayMatches[0]!);
+  if (headers.length === 0 || headers.every((h) => !h)) return [];
 
   const rows: Record<string, string>[] = [];
   for (let i = 1; i < arrayMatches.length; i++) {
-    const valMatch = arrayMatches[i]!.match(/<string>([^<]*)<\/string>/g);
-    const vals = valMatch?.map((m) => m.replace(/<\/?string>/g, '')) ?? [];
+    const vals = extractStrings(arrayMatches[i]!);
+    // All-empty rows stay skipped — readback callers treat that as "no row".
     if (vals.length === 0 || vals.every((v) => !v)) continue;
 
     const row: Record<string, string> = {};

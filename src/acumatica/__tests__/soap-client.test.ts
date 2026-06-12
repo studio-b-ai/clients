@@ -582,6 +582,46 @@ describe('SoapClient', () => {
   </soap:Body>
 </soap:Envelope>`;
 
+  // Live-captured 2026-06-12 (prod SB501000, container ZZ-PROBE-20260607):
+  // Acumatica emits empty fields as self-closing <string /> — the value row
+  // below is the verbatim wire bytes (single line, as captured).
+  const EXPORT_SELF_CLOSING_BODY = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <ExportResponse xmlns="http://www.acumatica.com/typed/">
+      <ExportResult>
+        <ArrayOfString>
+          <string>ContainerCD</string>
+          <string>BookingRef</string>
+          <string>BillOfLading</string>
+          <string>ETD</string>
+          <string>SealNbr</string>
+        </ArrayOfString>
+        <ArrayOfString><string>ZZ-PROBE-20260607</string><string>CNT000105</string><string /><string>1/20/2030 12:00:00 AM</string><string /></ArrayOfString>
+      </ExportResult>
+    </ExportResponse>
+  </soap:Body>
+</soap:Envelope>`;
+
+  const EXPORT_EMPTY_VARIANTS_BODY = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <ExportResponse xmlns="http://www.acumatica.com/typed/">
+      <ExportResult>
+        <ArrayOfString>
+          <string>ContainerCD</string>
+          <string>BookingRef</string>
+          <string>BillOfLading</string>
+          <string>ETD</string>
+          <string>SealNbr</string>
+        </ArrayOfString>
+        <ArrayOfString><string /><string/><string /><string/><string /></ArrayOfString>
+        <ArrayOfString><string>CNT000106</string><string/><string>MBOL-X1</string><string /><string>SEAL-9</string></ArrayOfString>
+      </ExportResult>
+    </ExportResponse>
+  </soap:Body>
+</soap:Envelope>`;
+
   describe('exportScreen()', () => {
     it('sends Export SOAPAction and parses ArrayOfString rows', async () => {
       mockRequest.mockResolvedValueOnce(
@@ -646,6 +686,63 @@ describe('SoapClient', () => {
 
       const rows = await client.exportScreen('SM205530', [], 100);
       expect(rows).toEqual([]);
+    });
+
+    it('preserves self-closing <string /> empties positionally (live-captured SB501000 row)', async () => {
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, LOGIN_SUCCESS_BODY, {
+          'set-cookie': '.ASPXAUTH=abc123; path=/',
+        }),
+      );
+      await client.login('SB501000');
+      vi.clearAllMocks();
+
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, EXPORT_SELF_CLOSING_BODY),
+      );
+
+      const rows = await client.exportScreen('SB501000', [], 5);
+
+      // Pre-fix, the two <string /> positions were dropped and every later
+      // column shifted left: BillOfLading wrongly read the ETD date.
+      expect(rows).toEqual([
+        {
+          ContainerCD: 'ZZ-PROBE-20260607',
+          BookingRef: 'CNT000105',
+          BillOfLading: '',
+          ETD: '1/20/2030 12:00:00 AM',
+          SealNbr: '',
+        },
+      ]);
+    });
+
+    it('skips all-empty rows and keeps no-space <string/> positions', async () => {
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, LOGIN_SUCCESS_BODY, {
+          'set-cookie': '.ASPXAUTH=abc123; path=/',
+        }),
+      );
+      await client.login('SB501000');
+      vi.clearAllMocks();
+
+      mockRequest.mockResolvedValueOnce(
+        mockResponse(200, EXPORT_EMPTY_VARIANTS_BODY),
+      );
+
+      const rows = await client.exportScreen('SB501000', [], 5);
+
+      // The all-self-closing row is skipped (readback callers rely on a
+      // skipped row reading as "no row"); the mixed-variant row keeps every
+      // empty field in position.
+      expect(rows).toEqual([
+        {
+          ContainerCD: 'CNT000106',
+          BookingRef: '',
+          BillOfLading: 'MBOL-X1',
+          ETD: '',
+          SealNbr: 'SEAL-9',
+        },
+      ]);
     });
 
     it('throws on SOAP fault', async () => {
