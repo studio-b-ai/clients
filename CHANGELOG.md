@@ -5,6 +5,13 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3](https://github.com/studio-b-ai/clients/compare/v1.2.2...v1.2.3) (2026-06-12)
+
+
+### Bug Fixes
+
+* **acumatica:** getAll — caller \$top/\$skip must not override pagination controls (5,390-row duplicate incident) ([#33](https://github.com/studio-b-ai/clients/issues/33)) ([02e2a76](https://github.com/studio-b-ai/clients/commit/02e2a76a88a560169f2b2272bdac6a5cba2d2af5))
+
 ## [1.2.2](https://github.com/studio-b-ai/clients/compare/v1.2.1...v1.2.2) (2026-06-12)
 
 
