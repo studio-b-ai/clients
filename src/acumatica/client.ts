@@ -750,20 +750,51 @@ export class AcumaticaClient {
 
   /**
    * Auto-paginate a list query, fetching all pages.
+   *
+   * Caller-supplied `$top` is treated as a TOTAL result cap (default: unlimited).
+   * Caller-supplied `$skip` is treated as a STARTING offset (default: 0).
+   * These are NOT forwarded verbatim to each page request — the loop manages its
+   * own per-request `$top`/`$skip` so a caller `$top=3000` never overrides the
+   * internal 100-record page size.
+   *
+   * Before this fix a caller `$top=3000` on a 989-row result set produced requests
+   * `$top=3000&$skip=0,100,...,900`, concatenating overlapping windows and returning
+   * 5,390 rows (989 unique, duplicated 1×–10×).
    */
   async getAll(
     entity: string,
     params: Record<string, string | number> = {},
   ): Promise<unknown[]> {
+    // Destructure caller pagination controls — they must not ride through to
+    // each per-page request unmodified.
+    const { $top: callerTop, $skip: callerSkip, ...restParams } = params;
+
+    // Accept both numeric and finite-string representations (params is typed
+    // Record<string, string | number> so callers may pass string values).
+    const parseIntParam = (v: string | number | undefined): number | undefined => {
+      if (typeof v === 'number' && isFinite(v)) return v;
+      if (typeof v === 'string') {
+        const n = Number(v);
+        if (isFinite(n)) return n;
+      }
+      return undefined;
+    };
+
+    const totalCap = parseIntParam(callerTop) ?? Infinity;
+    const pageSize = 100;
+
     const results: unknown[] = [];
-    let skip = 0;
-    const top = 100;
+    let skip = parseIntParam(callerSkip) ?? 0;
 
     while (true) {
+      const remaining = totalCap - results.length;
+      if (remaining <= 0) break;
+
+      const requestTop = Math.min(pageSize, remaining);
       const page = (await this.get(entity, {
-        $top: top,
+        ...restParams,
+        $top: requestTop,
         $skip: skip,
-        ...params,
       })) as unknown[];
 
       if (!Array.isArray(page)) {
@@ -776,8 +807,8 @@ export class AcumaticaClient {
       }
 
       results.push(...page);
-      if (page.length < top) break;
-      skip += top;
+      if (page.length < requestTop) break; // Short page — no more data
+      skip += page.length;
     }
     return results;
   }
