@@ -125,7 +125,7 @@ export class MicrosoftClient {
     return this.fetch<any>(`${path}?${params.toString()}`);
   }
 
-  async createEvent(opts: { subject: string; startDateTime: string; endDateTime: string; attendees?: Array<{ email: string }>; body?: string; location?: string; isOnlineMeeting?: boolean; userEmail?: string; startTimeZone?: string; endTimeZone?: string }) {
+  async createEvent(opts: { subject: string; startDateTime: string; endDateTime: string; attendees?: Array<{ email: string }>; body?: string; location?: string; isOnlineMeeting?: boolean; userEmail?: string; startTimeZone?: string; endTimeZone?: string; recurrence?: any }) {
     const event: any = {
       subject: opts.subject,
       start: { dateTime: opts.startDateTime, timeZone: opts.startTimeZone ?? 'UTC' },
@@ -135,6 +135,7 @@ export class MicrosoftClient {
     if (opts.body) event.body = { contentType: 'HTML', content: opts.body };
     if (opts.location) event.location = { displayName: opts.location };
     if (opts.isOnlineMeeting) event.isOnlineMeeting = true;
+    if (opts.recurrence) event.recurrence = opts.recurrence;
     return this.fetch<any>(`${this.userPath(opts.userEmail)}/events`, { method: 'POST', body: JSON.stringify(event) });
   }
 
