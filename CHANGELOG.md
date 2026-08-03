@@ -5,6 +5,13 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4](https://github.com/studio-b-ai/clients/compare/v1.2.3...v1.2.4) (2026-08-03)
+
+
+### Bug Fixes
+
+* pass recurrence through createEvent (closes [#35](https://github.com/studio-b-ai/clients/issues/35)) ([#36](https://github.com/studio-b-ai/clients/issues/36)) ([5cab147](https://github.com/studio-b-ai/clients/commit/5cab14726e059b11ad289923913f4d291c91673d))
+
 ## [1.2.3](https://github.com/studio-b-ai/clients/compare/v1.2.2...v1.2.3) (2026-06-12)
 
 
