@@ -162,14 +162,12 @@ export class HubSpotClient {
 
   // Generic CRM search — the primary fix target
   async searchObjects(objectType: string, opts: HubSpotSearchOpts) {
+    // Filter passthrough is guarded by __tests__/search-body-completeness.test.ts
+    // (every HubSpotSearchOpts field survives buildSearchBody) — the former
+    // always-on console.debug of the full body is gone: it bypassed consumers'
+    // structured loggers and printed a multi-line JSON blob to stdout on EVERY
+    // generic search (webhook-router runs one per upsert lookup).
     const body = this.buildSearchBody(opts, []);
-
-    // Debug logging: always log outbound body so filter passthrough can be verified
-    console.debug(
-      `[HubSpot] POST /crm/v3/objects/${objectType}/search`,
-      JSON.stringify(body, null, 2)
-    );
-
     return this.fetch<any>('POST', `/crm/v3/objects/${objectType}/search`, body);
   }
 
