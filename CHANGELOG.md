@@ -5,6 +5,13 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5](https://github.com/studio-b-ai/clients/compare/v1.2.4...v1.2.5) (2026-08-17)
+
+
+### Bug Fixes
+
+* **hubspot:** drop the always-on console.debug of every searchObjects body ([#41](https://github.com/studio-b-ai/clients/issues/41)) ([924c1d7](https://github.com/studio-b-ai/clients/commit/924c1d7b0b384c2dfc62064fcba13dcc8e269d7d))
+
 ## [1.2.4](https://github.com/studio-b-ai/clients/compare/v1.2.3...v1.2.4) (2026-08-03)
 
 
