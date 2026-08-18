@@ -383,10 +383,10 @@ export type SendOutgoingEmailTrackedInput = {
   mode?: OutgoingEmailLogMode;
 };
 
-export type SendOutgoingEmailTrackedResult = {
+export type SendOutgoingEmailTrackedResult<TSend = unknown> = {
   sent: true;
-  /** Whatever the send strategy returned (e.g. a provider message id), if anything. */
-  send?: { via?: string; messageId?: string } | void;
+  /** Whatever the send strategy returned (a provider receipt / message id), verbatim. */
+  send: TSend;
   hubspot:
     | { logged: true; engagementId: string; contactIds: string[]; createdContactIds: string[]; companyIds: string[]; ownerId: string | null }
     | { logged: false; skipped: 'all-internal' | 'exempt'; reason?: string }
@@ -408,11 +408,11 @@ export type SendOutgoingEmailTrackedResult = {
  * The strategy is the pluggable seam (Graph today; a HubSpot-native send is a
  * different `send` with the same receipt).
  */
-export async function sendOutgoingEmailTracked(
+export async function sendOutgoingEmailTracked<TSend = void>(
   hubspot: Pick<HubSpotClient, 'ensureContactByEmail' | 'getPrimaryCompanyIdForContact' | 'getOwnerIdByEmail' | 'logOutgoingEmail'>,
   input: SendOutgoingEmailTrackedInput,
-  send: () => Promise<{ via?: string; messageId?: string } | void>,
-): Promise<SendOutgoingEmailTrackedResult> {
+  send: () => Promise<TSend>,
+): Promise<SendOutgoingEmailTrackedResult<TSend>> {
   const mode: OutgoingEmailLogMode = input.mode ?? 'enforce';
   const exempt = input.logExempt?.trim();
   if (exempt) {

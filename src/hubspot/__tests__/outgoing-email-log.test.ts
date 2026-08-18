@@ -823,16 +823,17 @@ describe('sendOutgoingEmailTracked', () => {
     });
   }
 
-  it('happy path: resolve → send → record, in that order; receipt is logged:true with the engagement id', async () => {
+  it('happy path: resolve → send → record, in that order; receipt is logged:true with the engagement id and the send receipt verbatim (generic, codex P2)', async () => {
     happyRoutes();
-    const order: string[] = [];
-    const send = vi.fn(async () => { order.push('send'); return { via: 'graph' as const }; });
+    // an arbitrary provider receipt shape — the orchestrator is generic over it
+    const send = vi.fn(async () => ({ id: 'provider-msg-1', via: 'graph' }));
 
     const result = await sendOutgoingEmailTracked(makeClient(), baseInput, send);
 
     expect(result.sent).toBe(true);
     expect(result.hubspot).toMatchObject({ logged: true, engagementId: 'engagement-t1', contactIds: ['contact-1'] });
-    expect(result.send).toEqual({ via: 'graph' });
+    expect(result.send).toEqual({ id: 'provider-msg-1', via: 'graph' });
+    expect(result.send.id).toBe('provider-msg-1'); // typed access — no cast needed
     // resolve (contact search) happened BEFORE send; the engagement POST AFTER send
     const searchIdx = captured.findIndex((c) => c.url.includes('/contacts/search'));
     const emailIdx = captured.findIndex((c) => c.method === 'POST' && c.url.includes('/crm/v3/objects/emails'));

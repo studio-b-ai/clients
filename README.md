@@ -93,7 +93,7 @@ between them. `{ skipped: 'all-internal' }` comes back with zero HubSpot
 calls when every recipient's domain is in `DEFAULT_INTERNAL_EMAIL_DOMAINS`
 (override via `internalDomains`).
 
-**Preferred entrypoint — `sendOutgoingEmailTracked`** wraps ANY send strategy
+**Preferred entrypoint — `sendOutgoingEmailTracked`** wraps ANY send strategy (generic over its return)
 in the by-construction law (resolve → send → record) and returns one receipt:
 
 ```ts
