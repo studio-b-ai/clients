@@ -154,6 +154,24 @@ function isInternalEmail(email: string, internalDomains: string[]): boolean {
 }
 
 /**
+ * Default owner-lookup candidates for a sender: the exact address first, then
+ * the same local-part on every internal domain (deduped, order preserved).
+ * Exported for tests + callers that want to extend the list.
+ */
+export function ownerEmailCandidatesFor(fromEmail: string, internalDomains: string[]): string[] {
+  const lower = fromEmail.trim().toLowerCase();
+  const at = lower.lastIndexOf('@');
+  if (at === -1) return [lower];
+  const local = lower.slice(0, at);
+  const out = [lower];
+  for (const d of internalDomains) {
+    const c = `${local}@${d.toLowerCase()}`;
+    if (!out.includes(c)) out.push(c);
+  }
+  return out;
+}
+
+/**
  * Phase 1 (BEFORE send): classify recipients as internal/external and ensure
  * every external one has a HubSpot contact. Zero HubSpot calls when every
  * recipient is internal. Fail-closed — throws rather than returning a partial
@@ -212,7 +230,23 @@ export async function resolveOutgoingEmailRecipients(
 export async function recordOutgoingEmail(
   hubspot: Pick<HubSpotClient, 'getPrimaryCompanyIdForContact' | 'getOwnerIdByEmail' | 'logOutgoingEmail'>,
   resolved: ResolvedOutgoingEmailRecipients,
-  input: { fromEmail: string; subject: string; textBody?: string; htmlBody?: string; sentAt?: Date },
+  input: {
+    fromEmail: string;
+    subject: string;
+    textBody?: string;
+    htmlBody?: string;
+    sentAt?: Date;
+    /**
+     * Owner-lookup candidates, tried in order; the first HubSpot owner match wins.
+     * Default: `[fromEmail, ...same local-part @ each internal domain]` — staff
+     * mailboxes and HubSpot user emails live on DIFFERENT internal domains
+     * (live 2026-08-18: sender kevin@asthetik.com, HubSpot owner
+     * kevin@heritagefabrics.com → exact-only lookup left the engagement unowned).
+     */
+    ownerEmailCandidates?: string[];
+    /** Internal domains used to derive the default owner candidates. */
+    internalDomains?: string[];
+  },
 ): Promise<LogOutgoingEmailResult> {
   if (resolved.skipped === 'all-internal') return { skipped: 'all-internal' };
 
@@ -234,11 +268,20 @@ export async function recordOutgoingEmail(
   const companyIds = [...companyIdSet];
 
   // Best-effort — an owner-lookup failure must never block logging the email.
+  // Candidates are tried in order (exact sender first, then the same local-part
+  // across the internal domains); the first match wins, so a null result means
+  // NONE matched, never that the first one didn't.
   let ownerId: string | null = null;
-  try {
-    ownerId = await hubspot.getOwnerIdByEmail(input.fromEmail);
-  } catch {
-    // best-effort — see comment above.
+  const ownerCandidates =
+    input.ownerEmailCandidates ??
+    ownerEmailCandidatesFor(input.fromEmail, input.internalDomains ?? DEFAULT_INTERNAL_EMAIL_DOMAINS);
+  for (const candidate of ownerCandidates) {
+    try {
+      ownerId = await hubspot.getOwnerIdByEmail(candidate);
+    } catch {
+      ownerId = null; // best-effort — see comment above; keep trying the next candidate.
+    }
+    if (ownerId) break;
   }
 
   // Rebuild the original to/cc split from the resolved contacts' `kind` —
@@ -293,6 +336,8 @@ export async function logOutgoingEmailToCrm(
     htmlBody?: string;
     sentAt?: Date;
     internalDomains?: string[];
+    /** See `recordOutgoingEmail` — owner-lookup candidates (default: sender + same local-part @ internal domains). */
+    ownerEmailCandidates?: string[];
   },
 ): Promise<LogOutgoingEmailResult> {
   const resolved = await resolveOutgoingEmailRecipients(hubspot, {
@@ -306,5 +351,7 @@ export async function logOutgoingEmailToCrm(
     textBody: input.textBody,
     htmlBody: input.htmlBody,
     sentAt: input.sentAt,
+    ownerEmailCandidates: input.ownerEmailCandidates,
+    internalDomains: input.internalDomains,
   });
 }

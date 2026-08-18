@@ -20,6 +20,7 @@ import {
   recordOutgoingEmail,
   logOutgoingEmailToCrm,
   HubSpotEmailLogError,
+  ownerEmailCandidatesFor,
   type ResolvedOutgoingEmailRecipients,
 } from '../recipes.js';
 
@@ -615,6 +616,66 @@ describe('recordOutgoingEmail', () => {
     expect(result).toMatchObject({ engagementId: 'engagement-88', companyIds: [], ownerId: null });
   });
 
+  it('resolves the owner across internal domains: sender kevin@asthetik.com finds owner kevin@heritagefabrics.com (live 2026-08-18 gap)', async () => {
+    stubRoutedFetch();
+    const ownerLookups: string[] = [];
+    addRoute((url, method) => {
+      if (method === 'GET' && url.includes('/associations/companies')) return { status: 404, body: {} };
+      if (method === 'GET' && url.includes('/crm/v3/owners')) {
+        const email = decodeURIComponent(new URL(url).searchParams.get('email') ?? '');
+        ownerLookups.push(email);
+        return { status: 200, body: { results: email === 'kevin@heritagefabrics.com' ? [{ id: 'owner-kevin' }] : [] } };
+      }
+      if (method === 'POST' && url.includes('/crm/v3/objects/emails')) return { status: 201, body: { id: 'engagement-owner-1' } };
+      return undefined;
+    });
+
+    const resolved: ResolvedOutgoingEmailRecipients = {
+      external: ['ext@example.com'],
+      contacts: [{ email: 'ext@example.com', id: 'contact-1', created: false, kind: 'to' }],
+    };
+
+    const result = await recordOutgoingEmail(makeClient(), resolved, { fromEmail: 'kevin@asthetik.com', subject: 'Hi', textBody: 'Body' });
+
+    expect(result).toMatchObject({ engagementId: 'engagement-owner-1', ownerId: 'owner-kevin' });
+    // exact sender first, then the same local-part on the internal domains, stopping at the first hit
+    expect(ownerLookups[0]).toBe('kevin@asthetik.com');
+    expect(ownerLookups).toContain('kevin@heritagefabrics.com');
+    expect(ownerLookups.indexOf('kevin@heritagefabrics.com')).toBe(ownerLookups.length - 1);
+    const emailPost = captured.find((c) => c.method === 'POST' && c.url.includes('/crm/v3/objects/emails'))!;
+    expect((emailPost.body as any).properties.hubspot_owner_id).toBe('owner-kevin');
+    // hs_email_headers.from stays the REAL sender, not the owner alias
+    expect(JSON.parse((emailPost.body as any).properties.hs_email_headers).from).toEqual({ email: 'kevin@asthetik.com' });
+  });
+
+  it('honors explicit ownerEmailCandidates verbatim (no domain fan-out) and leaves ownerId null when none match', async () => {
+    stubRoutedFetch();
+    const ownerLookups: string[] = [];
+    addRoute((url, method) => {
+      if (method === 'GET' && url.includes('/associations/companies')) return { status: 404, body: {} };
+      if (method === 'GET' && url.includes('/crm/v3/owners')) {
+        ownerLookups.push(decodeURIComponent(new URL(url).searchParams.get('email') ?? ''));
+        return { status: 200, body: { results: [] } };
+      }
+      if (method === 'POST' && url.includes('/crm/v3/objects/emails')) return { status: 201, body: { id: 'engagement-owner-2' } };
+      return undefined;
+    });
+
+    const resolved: ResolvedOutgoingEmailRecipients = {
+      external: ['ext@example.com'],
+      contacts: [{ email: 'ext@example.com', id: 'contact-1', created: false, kind: 'to' }],
+    };
+
+    const result = await recordOutgoingEmail(makeClient(), resolved, {
+      fromEmail: 'kevin@asthetik.com',
+      subject: 'Hi',
+      ownerEmailCandidates: ['ops@heritagefabrics.com'],
+    });
+
+    expect(result).toMatchObject({ engagementId: 'engagement-owner-2', ownerId: null });
+    expect(ownerLookups).toEqual(['ops@heritagefabrics.com']);
+  });
+
   it('throws HubSpotEmailLogError{stage:"record", contactIds} when the engagement POST fails (email already sent)', async () => {
     stubRoutedFetch();
     addRoute((url, method) => {
@@ -722,5 +783,23 @@ describe('logOutgoingEmailToCrm', () => {
     const message = (caught as Error).message;
     expect(message).not.toContain(distinctiveToken);
     expect((caught as Error).stack ?? '').not.toContain(distinctiveToken);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ownerEmailCandidatesFor (pure helper)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('ownerEmailCandidatesFor', () => {
+  it('yields the exact sender first, then the same local-part on each internal domain, deduped', () => {
+    expect(ownerEmailCandidatesFor('Kevin@Asthetik.com', ['asthetik.com', 'heritagefabrics.com', 'b.studio'])).toEqual([
+      'kevin@asthetik.com',
+      'kevin@heritagefabrics.com',
+      'kevin@b.studio',
+    ]);
+  });
+
+  it('returns just the lowercased input when it has no @', () => {
+    expect(ownerEmailCandidatesFor('NOT-AN-EMAIL', DEFAULT_INTERNAL_EMAIL_DOMAINS)).toEqual(['not-an-email']);
   });
 });
