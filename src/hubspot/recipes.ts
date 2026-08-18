@@ -121,7 +121,14 @@ export type ResolvedOutgoingEmailRecipients =
   | {
       skipped?: undefined;
       external: string[];
-      contacts: Array<{ email: string; id: string; created: boolean }>;
+      /**
+       * `kind` preserves which line the caller's original send had this
+       * address on — 'to' wins when the same address appears in both `to`
+       * and `cc` — so `recordOutgoingEmail` can rebuild an accurate
+       * `hs_email_headers` split instead of collapsing every resolved
+       * contact onto the `to` line.
+       */
+      contacts: Array<{ email: string; id: string; created: boolean; kind: 'to' | 'cc' }>;
     };
 
 export type LogOutgoingEmailResult =
@@ -134,20 +141,6 @@ export type LogOutgoingEmailResult =
       companyIds: string[];
       ownerId: string | null;
     };
-
-/** Lowercase + dedupe a list of email addresses, preserving first-seen order. */
-function dedupeLowerEmails(emails: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const email of emails) {
-    const lower = email.toLowerCase();
-    if (!seen.has(lower)) {
-      seen.add(lower);
-      out.push(lower);
-    }
-  }
-  return out;
-}
 
 /** The domain part of an email address, lowercased. Plus-tags never affect this. */
 function emailDomain(email: string): string {
@@ -172,19 +165,31 @@ export async function resolveOutgoingEmailRecipients(
   input: { to: string[]; cc?: string[]; internalDomains?: string[] },
 ): Promise<ResolvedOutgoingEmailRecipients> {
   const internalDomains = input.internalDomains ?? DEFAULT_INTERNAL_EMAIL_DOMAINS;
-  const allRecipients = dedupeLowerEmails([...(input.to ?? []), ...(input.cc ?? [])]);
-  const external = allRecipients.filter((email) => !isInternalEmail(email, internalDomains));
+
+  // Lowercase + dedupe while tracking which line each address was on — 'to'
+  // wins when the same address appears in both, since a human reading the
+  // sent email would call that recipient "on the To line".
+  const kindByEmail = new Map<string, 'to' | 'cc'>();
+  for (const email of input.cc ?? []) {
+    const lower = email.toLowerCase();
+    if (!kindByEmail.has(lower)) kindByEmail.set(lower, 'cc');
+  }
+  for (const email of input.to ?? []) {
+    kindByEmail.set(email.toLowerCase(), 'to');
+  }
+
+  const external = [...kindByEmail.keys()].filter((email) => !isInternalEmail(email, internalDomains));
 
   if (external.length === 0) {
     return { skipped: 'all-internal' };
   }
 
-  const contacts: Array<{ email: string; id: string; created: boolean }> = [];
+  const contacts: Array<{ email: string; id: string; created: boolean; kind: 'to' | 'cc' }> = [];
   try {
     // Sequential is fine — capped at a handful of recipients per outgoing email.
     for (const email of external) {
       const { id, created } = await hubspot.ensureContactByEmail(email);
-      contacts.push({ email, id, created });
+      contacts.push({ email, id, created, kind: kindByEmail.get(email)! });
     }
   } catch (err) {
     throw new HubSpotEmailLogError(
@@ -236,11 +241,20 @@ export async function recordOutgoingEmail(
     // best-effort — see comment above.
   }
 
+  // Rebuild the original to/cc split from the resolved contacts' `kind` —
+  // a CC'd contact must not be recorded as a To recipient in hs_email_headers
+  // (codex P1 pass 1: collapsing to/cc misrepresents the sent email on the
+  // HubSpot timeline). `contactIds`/associations above are UNAFFECTED by the
+  // split — every resolved contact gets the engagement association either way.
+  const to = resolved.contacts.filter((c) => c.kind === 'to').map((c) => c.email);
+  const cc = resolved.contacts.filter((c) => c.kind === 'cc').map((c) => c.email);
+
   let engagement: { id: string };
   try {
     engagement = await hubspot.logOutgoingEmail({
       fromEmail: input.fromEmail,
-      to: resolved.contacts.map((c) => c.email),
+      to,
+      cc,
       subject: input.subject,
       textBody: input.textBody,
       htmlBody: input.htmlBody,

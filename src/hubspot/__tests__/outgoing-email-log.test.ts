@@ -439,7 +439,7 @@ describe('resolveOutgoingEmailRecipients', () => {
     expect(captured).toHaveLength(0);
   });
 
-  it('resolves only the external recipients from a mixed to/cc list, deduped + lowercased', async () => {
+  it('resolves only the external recipients from a mixed to/cc list, deduped + lowercased, "to" winning the kind when an address is on both lines', async () => {
     stubRoutedFetch();
     const searchedEmails: string[] = [];
     addRoute((url, method, body) => {
@@ -456,15 +456,32 @@ describe('resolveOutgoingEmailRecipients', () => {
 
     const result = await resolveOutgoingEmailRecipients(makeClient(), {
       // 'External@Example.com' (to) and 'external@example.com' (cc) collapse to one
-      // after lowercase-dedupe; 'kevin@heritagefabrics.com' is internal by default.
+      // after lowercase-dedupe, with kind 'to' winning; 'kevin@heritagefabrics.com'
+      // is internal by default.
       to: ['External@Example.com', 'kevin@heritagefabrics.com'],
       cc: ['external@example.com'],
     });
 
     expect(result.skipped).toBeUndefined();
     expect((result as any).external).toEqual(['external@example.com']);
-    expect((result as any).contacts).toEqual([{ email: 'external@example.com', id: 'contact-for-external@example.com', created: true }]);
+    expect((result as any).contacts).toEqual([{ email: 'external@example.com', id: 'contact-for-external@example.com', created: true, kind: 'to' }]);
     expect(searchedEmails).toEqual(['external@example.com']);
+  });
+
+  it('marks a cc-only external recipient with kind "cc"', async () => {
+    stubRoutedFetch();
+    addRoute((url, method, body) => {
+      if (method === 'POST' && url.includes('/crm/v3/objects/contacts/search')) return { status: 200, body: { total: 0, results: [] } };
+      if (method === 'POST' && url.endsWith('/crm/v3/objects/contacts')) return { status: 201, body: { id: `contact-for-${(body as any).properties.email}` } };
+      return undefined;
+    });
+
+    const result = await resolveOutgoingEmailRecipients(makeClient(), {
+      to: ['kevin@heritagefabrics.com'], // internal — no external "to"
+      cc: ['ext-cc@example.com'],
+    });
+
+    expect((result as any).contacts).toEqual([{ email: 'ext-cc@example.com', id: 'contact-for-ext-cc@example.com', created: true, kind: 'cc' }]);
   });
 
   it('throws HubSpotEmailLogError{stage:"resolve"} and makes no /crm/v3/objects/emails POST when contact resolution fails', async () => {
@@ -533,7 +550,7 @@ describe('recordOutgoingEmail', () => {
 
     const resolved: ResolvedOutgoingEmailRecipients = {
       external: ['ext@example.com'],
-      contacts: [{ email: 'ext@example.com', id: 'contact-1', created: true }],
+      contacts: [{ email: 'ext@example.com', id: 'contact-1', created: true, kind: 'to' }],
     };
 
     const result = await recordOutgoingEmail(makeClient(), resolved, {
@@ -551,6 +568,34 @@ describe('recordOutgoingEmail', () => {
     });
   });
 
+  it('rebuilds the to/cc split from each contact\'s kind — a CC contact is NOT recorded as a To recipient (codex pass 1 P2)', async () => {
+    stubRoutedFetch();
+    addRoute((url, method) => {
+      if (method === 'GET' && url.includes('/associations/companies')) return { status: 404, body: {} };
+      if (method === 'GET' && url.includes('/crm/v3/owners')) return { status: 200, body: { results: [] } };
+      if (method === 'POST' && url.includes('/crm/v3/objects/emails')) return { status: 201, body: { id: 'engagement-cc-1' } };
+      return undefined;
+    });
+
+    const resolved: ResolvedOutgoingEmailRecipients = {
+      external: ['to-person@example.com', 'cc-person@example.com'],
+      contacts: [
+        { email: 'to-person@example.com', id: 'contact-to', created: false, kind: 'to' },
+        { email: 'cc-person@example.com', id: 'contact-cc', created: false, kind: 'cc' },
+      ],
+    };
+
+    await recordOutgoingEmail(makeClient(), resolved, { fromEmail: 'agent@heritagefabrics.com', subject: 'Hi', textBody: 'Body' });
+
+    const emailPost = captured.find((c) => c.method === 'POST' && c.url.includes('/crm/v3/objects/emails'))!;
+    const headers = JSON.parse((emailPost.body as any).properties.hs_email_headers);
+    expect(headers.to).toEqual([{ email: 'to-person@example.com' }]);
+    expect(headers.cc).toEqual([{ email: 'cc-person@example.com' }]);
+    // Both contacts are STILL associated to the engagement regardless of to/cc —
+    // the split only affects header display, not the CRM association.
+    expect((emailPost.body as any).associations).toHaveLength(2);
+  });
+
   it('is best-effort on company/owner lookup failures — the engagement is still created', async () => {
     stubRoutedFetch();
     addRoute((url, method) => {
@@ -562,7 +607,7 @@ describe('recordOutgoingEmail', () => {
 
     const resolved: ResolvedOutgoingEmailRecipients = {
       external: ['ext@example.com'],
-      contacts: [{ email: 'ext@example.com', id: 'contact-1', created: false }],
+      contacts: [{ email: 'ext@example.com', id: 'contact-1', created: false, kind: 'to' }],
     };
 
     const result = await recordOutgoingEmail(makeClient(), resolved, { fromEmail: 'agent@heritagefabrics.com', subject: 'Hi', textBody: 'Body' });
@@ -581,7 +626,7 @@ describe('recordOutgoingEmail', () => {
 
     const resolved: ResolvedOutgoingEmailRecipients = {
       external: ['ext@example.com'],
-      contacts: [{ email: 'ext@example.com', id: 'contact-1', created: true }],
+      contacts: [{ email: 'ext@example.com', id: 'contact-1', created: true, kind: 'to' }],
     };
 
     let caught: unknown;
