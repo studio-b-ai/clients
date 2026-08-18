@@ -6,6 +6,7 @@
  */
 
 import type { HubSpotClient } from './client.js';
+import { DEFAULT_INTERNAL_EMAIL_DOMAINS } from './client.js';
 
 /**
  * Upsert a CRM object by searching on a unique property.
@@ -81,4 +82,215 @@ export async function pipelineStageMap(
     map.set(stage.label, stage.stageId);
   }
   return map;
+}
+
+/**
+ * Outgoing-email CRM logging (Kevin 8/18, via the CTO seat — agent-sent
+ * business email is HubSpot-logged by construction).
+ *
+ * Two-phase contract, split so a caller can fail CLOSED before it ever sends:
+ *   1. `resolveOutgoingEmailRecipients()` — BEFORE the send. Filters out
+ *      internal recipients and ensures a HubSpot contact exists for every
+ *      external one. Throws `HubSpotEmailLogError{stage:'resolve'}` if a
+ *      contact can't be resolved — the caller must NOT send on that path.
+ *   2. `recordOutgoingEmail()` — AFTER the send succeeds. Best-effort company
+ *      + owner enrichment, then one atomic engagement create. Throws
+ *      `HubSpotEmailLogError{stage:'record'}` on failure — by this point the
+ *      email is already sent, so the caller reports "sent but not logged"
+ *      loudly with the ids rather than pretending nothing happened.
+ *
+ * `logOutgoingEmailToCrm()` composes both phases for a caller that doesn't
+ * need to interleave its own send between them.
+ */
+
+/** Thrown when outgoing-email CRM logging fails, naming which phase failed. */
+export class HubSpotEmailLogError extends Error {
+  readonly stage: 'resolve' | 'record';
+  readonly contactIds: string[];
+
+  constructor(stage: 'resolve' | 'record', message: string, contactIds: string[] = []) {
+    super(message);
+    this.name = 'HubSpotEmailLogError';
+    this.stage = stage;
+    this.contactIds = contactIds;
+  }
+}
+
+export type ResolvedOutgoingEmailRecipients =
+  | { skipped: 'all-internal' }
+  | {
+      skipped?: undefined;
+      external: string[];
+      contacts: Array<{ email: string; id: string; created: boolean }>;
+    };
+
+export type LogOutgoingEmailResult =
+  | { skipped: 'all-internal' }
+  | {
+      skipped?: undefined;
+      engagementId: string;
+      contactIds: string[];
+      createdContactIds: string[];
+      companyIds: string[];
+      ownerId: string | null;
+    };
+
+/** Lowercase + dedupe a list of email addresses, preserving first-seen order. */
+function dedupeLowerEmails(emails: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const email of emails) {
+    const lower = email.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      out.push(lower);
+    }
+  }
+  return out;
+}
+
+/** The domain part of an email address, lowercased. Plus-tags never affect this. */
+function emailDomain(email: string): string {
+  const at = email.lastIndexOf('@');
+  return at === -1 ? '' : email.slice(at + 1).toLowerCase();
+}
+
+function isInternalEmail(email: string, internalDomains: string[]): boolean {
+  const domain = emailDomain(email);
+  return internalDomains.some((d) => d.toLowerCase() === domain);
+}
+
+/**
+ * Phase 1 (BEFORE send): classify recipients as internal/external and ensure
+ * every external one has a HubSpot contact. Zero HubSpot calls when every
+ * recipient is internal. Fail-closed — throws rather than returning a partial
+ * result, so a caller resolving before its Graph send does not send on a
+ * resolve failure.
+ */
+export async function resolveOutgoingEmailRecipients(
+  hubspot: Pick<HubSpotClient, 'ensureContactByEmail'>,
+  input: { to: string[]; cc?: string[]; internalDomains?: string[] },
+): Promise<ResolvedOutgoingEmailRecipients> {
+  const internalDomains = input.internalDomains ?? DEFAULT_INTERNAL_EMAIL_DOMAINS;
+  const allRecipients = dedupeLowerEmails([...(input.to ?? []), ...(input.cc ?? [])]);
+  const external = allRecipients.filter((email) => !isInternalEmail(email, internalDomains));
+
+  if (external.length === 0) {
+    return { skipped: 'all-internal' };
+  }
+
+  const contacts: Array<{ email: string; id: string; created: boolean }> = [];
+  try {
+    // Sequential is fine — capped at a handful of recipients per outgoing email.
+    for (const email of external) {
+      const { id, created } = await hubspot.ensureContactByEmail(email);
+      contacts.push({ email, id, created });
+    }
+  } catch (err) {
+    throw new HubSpotEmailLogError(
+      'resolve',
+      `resolveOutgoingEmailRecipients: failed to resolve a recipient contact — refusing to ` +
+        `send (fail-closed). Cause: ${err instanceof Error ? err.message : String(err)}`,
+      [],
+    );
+  }
+
+  return { external, contacts };
+}
+
+/**
+ * Phase 2 (AFTER send): best-effort company + owner enrichment, then one
+ * atomic engagement create. `resolved` comes from `resolveOutgoingEmailRecipients`
+ * — an `{ skipped: 'all-internal' }` input passes straight through with zero
+ * HubSpot calls.
+ */
+export async function recordOutgoingEmail(
+  hubspot: Pick<HubSpotClient, 'getPrimaryCompanyIdForContact' | 'getOwnerIdByEmail' | 'logOutgoingEmail'>,
+  resolved: ResolvedOutgoingEmailRecipients,
+  input: { fromEmail: string; subject: string; textBody?: string; htmlBody?: string; sentAt?: Date },
+): Promise<LogOutgoingEmailResult> {
+  if (resolved.skipped === 'all-internal') return { skipped: 'all-internal' };
+
+  const contactIds = resolved.contacts.map((c) => c.id);
+  const createdContactIds = resolved.contacts.filter((c) => c.created).map((c) => c.id);
+
+  // Best-effort — a company-association lookup failure must never block
+  // logging the email itself (the client already swallows a 404 to null;
+  // this also swallows any other error the same way).
+  const companyIdSet = new Set<string>();
+  for (const contactId of contactIds) {
+    try {
+      const companyId = await hubspot.getPrimaryCompanyIdForContact(contactId);
+      if (companyId) companyIdSet.add(companyId);
+    } catch {
+      // best-effort — see comment above.
+    }
+  }
+  const companyIds = [...companyIdSet];
+
+  // Best-effort — an owner-lookup failure must never block logging the email.
+  let ownerId: string | null = null;
+  try {
+    ownerId = await hubspot.getOwnerIdByEmail(input.fromEmail);
+  } catch {
+    // best-effort — see comment above.
+  }
+
+  let engagement: { id: string };
+  try {
+    engagement = await hubspot.logOutgoingEmail({
+      fromEmail: input.fromEmail,
+      to: resolved.contacts.map((c) => c.email),
+      subject: input.subject,
+      textBody: input.textBody,
+      htmlBody: input.htmlBody,
+      sentAt: input.sentAt,
+      ownerId,
+      contactIds,
+      companyIds,
+    });
+  } catch (err) {
+    throw new HubSpotEmailLogError(
+      'record',
+      `recordOutgoingEmail: the email was SENT but the HubSpot engagement create failed — ` +
+        `NOT logged. contactIds=[${contactIds.join(', ')}]. Cause: ${err instanceof Error ? err.message : String(err)}`,
+      contactIds,
+    );
+  }
+
+  return { engagementId: engagement.id, contactIds, createdContactIds, companyIds, ownerId };
+}
+
+/**
+ * Composes `resolveOutgoingEmailRecipients` + `recordOutgoingEmail` for a
+ * caller that logs before AND after its send in one call — i.e. it does not
+ * need to interleave its own Graph/SMTP send between the two phases. A caller
+ * that must not send until recipients are resolved should call the two
+ * phases directly instead (see the module doc comment above).
+ */
+export async function logOutgoingEmailToCrm(
+  hubspot: HubSpotClient,
+  input: {
+    fromEmail: string;
+    to: string[];
+    cc?: string[];
+    subject: string;
+    textBody?: string;
+    htmlBody?: string;
+    sentAt?: Date;
+    internalDomains?: string[];
+  },
+): Promise<LogOutgoingEmailResult> {
+  const resolved = await resolveOutgoingEmailRecipients(hubspot, {
+    to: input.to,
+    cc: input.cc,
+    internalDomains: input.internalDomains,
+  });
+  return recordOutgoingEmail(hubspot, resolved, {
+    fromEmail: input.fromEmail,
+    subject: input.subject,
+    textBody: input.textBody,
+    htmlBody: input.htmlBody,
+    sentAt: input.sentAt,
+  });
 }
