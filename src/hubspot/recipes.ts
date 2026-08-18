@@ -355,3 +355,115 @@ export async function logOutgoingEmailToCrm(
     internalDomains: input.internalDomains,
   });
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// sendOutgoingEmailTracked — the SEND-PATH-AGNOSTIC orchestrator
+// (Kevin 8/18: agent-sent email is HubSpot-logged BY CONSTRUCTION)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * `enforce` (default): a recipient that cannot be resolved to a CRM contact
+ * BLOCKS the send (fail-closed — nothing goes out untracked).
+ * `warn`: the send proceeds and the caller gets `hubspot.logged: false` +
+ * `error` to alert on (degrade mode for a HubSpot outage; never the default).
+ */
+export type OutgoingEmailLogMode = 'enforce' | 'warn';
+
+export type SendOutgoingEmailTrackedInput = {
+  fromEmail: string;
+  to: string[];
+  cc?: string[];
+  subject: string;
+  textBody?: string;
+  htmlBody?: string;
+  internalDomains?: string[];
+  ownerEmailCandidates?: string[];
+  /** Non-empty reason ⇒ send WITHOUT logging (surfaced in the receipt). */
+  logExempt?: string;
+  mode?: OutgoingEmailLogMode;
+};
+
+export type SendOutgoingEmailTrackedResult<TSend = unknown> = {
+  sent: true;
+  /** Whatever the send strategy returned (a provider receipt / message id), verbatim. */
+  send: TSend;
+  hubspot:
+    | { logged: true; engagementId: string; contactIds: string[]; createdContactIds: string[]; companyIds: string[]; ownerId: string | null }
+    | { logged: false; skipped: 'all-internal' | 'exempt'; reason?: string }
+    | { logged: false; skipped?: undefined; stage: 'resolve' | 'record'; error: string; contactIds: string[] };
+};
+
+/**
+ * Send an email through ANY strategy (`send`) and guarantee the CRM record:
+ *
+ *   1. `logExempt` set → send, no HubSpot calls, receipt says `skipped: 'exempt'`.
+ *   2. resolve recipients (creates missing contacts for EXTERNAL recipients;
+ *      all-internal ⇒ send, `skipped: 'all-internal'`).
+ *      - resolve FAILS: `enforce` ⇒ throw `HubSpotEmailLogError{stage:'resolve'}`
+ *        BEFORE anything is sent; `warn` ⇒ send anyway, receipt carries the error.
+ *   3. `send()` — any throw propagates (nothing was logged, nothing to undo).
+ *   4. record the engagement — a failure here can't un-send: the receipt says
+ *      `logged: false, stage: 'record'` and the caller MUST surface it loudly.
+ *
+ * The strategy is the pluggable seam (Graph today; a HubSpot-native send is a
+ * different `send` with the same receipt).
+ */
+export async function sendOutgoingEmailTracked<TSend = void>(
+  hubspot: Pick<HubSpotClient, 'ensureContactByEmail' | 'getPrimaryCompanyIdForContact' | 'getOwnerIdByEmail' | 'logOutgoingEmail'>,
+  input: SendOutgoingEmailTrackedInput,
+  send: () => Promise<TSend>,
+): Promise<SendOutgoingEmailTrackedResult<TSend>> {
+  const mode: OutgoingEmailLogMode = input.mode ?? 'enforce';
+  const exempt = input.logExempt?.trim();
+  if (exempt) {
+    const sendResult = await send();
+    return { sent: true, send: sendResult, hubspot: { logged: false, skipped: 'exempt', reason: exempt } };
+  }
+
+  let resolved: ResolvedOutgoingEmailRecipients | null = null;
+  let resolveError: HubSpotEmailLogError | null = null;
+  try {
+    resolved = await resolveOutgoingEmailRecipients(hubspot, {
+      to: input.to,
+      cc: input.cc,
+      internalDomains: input.internalDomains,
+    });
+  } catch (err) {
+    const typed = err instanceof HubSpotEmailLogError ? err : new HubSpotEmailLogError('resolve', String(err));
+    if (mode === 'enforce') throw typed; // fail-closed: nothing sent
+    resolveError = typed;
+  }
+
+  const sendResult = await send();
+
+  if (resolveError || !resolved) {
+    return {
+      sent: true,
+      send: sendResult,
+      hubspot: { logged: false, stage: 'resolve', error: resolveError?.message ?? 'resolve failed', contactIds: [] },
+    };
+  }
+  if (resolved.skipped === 'all-internal') {
+    return { sent: true, send: sendResult, hubspot: { logged: false, skipped: 'all-internal' } };
+  }
+
+  try {
+    const recorded = await recordOutgoingEmail(hubspot, resolved, {
+      fromEmail: input.fromEmail,
+      subject: input.subject,
+      textBody: input.textBody,
+      htmlBody: input.htmlBody,
+      sentAt: new Date(),
+      ownerEmailCandidates: input.ownerEmailCandidates,
+      internalDomains: input.internalDomains,
+    });
+    if (recorded.skipped) {
+      // unreachable by construction (resolved is not all-internal) — keep the type honest
+      return { sent: true, send: sendResult, hubspot: { logged: false, skipped: 'all-internal' } };
+    }
+    return { sent: true, send: sendResult, hubspot: { logged: true, ...recorded } };
+  } catch (err) {
+    const typed = err instanceof HubSpotEmailLogError ? err : new HubSpotEmailLogError('record', String(err), resolved.contacts.map((c) => c.id));
+    return { sent: true, send: sendResult, hubspot: { logged: false, stage: typed.stage, error: typed.message, contactIds: typed.contactIds } };
+  }
+}

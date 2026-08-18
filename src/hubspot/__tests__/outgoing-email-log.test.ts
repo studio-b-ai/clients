@@ -21,6 +21,7 @@ import {
   logOutgoingEmailToCrm,
   HubSpotEmailLogError,
   ownerEmailCandidatesFor,
+  sendOutgoingEmailTracked,
   type ResolvedOutgoingEmailRecipients,
 } from '../recipes.js';
 
@@ -801,5 +802,130 @@ describe('ownerEmailCandidatesFor', () => {
 
   it('returns just the lowercased input when it has no @', () => {
     expect(ownerEmailCandidatesFor('NOT-AN-EMAIL', DEFAULT_INTERNAL_EMAIL_DOMAINS)).toEqual(['not-an-email']);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// sendOutgoingEmailTracked (send-agnostic orchestrator — the by-construction law)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('sendOutgoingEmailTracked', () => {
+  const baseInput = { fromEmail: 'kevin@asthetik.com', to: ['ext@example.com'], subject: 'Hi', textBody: 'Body' };
+
+  function happyRoutes(engagementId = 'engagement-t1') {
+    stubRoutedFetch();
+    addRoute((url, method) => {
+      if (method === 'POST' && url.includes('/crm/v3/objects/contacts/search')) return { status: 200, body: { total: 1, results: [{ id: 'contact-1' }] } };
+      if (method === 'GET' && url.includes('/associations/companies')) return { status: 404, body: {} };
+      if (method === 'GET' && url.includes('/crm/v3/owners')) return { status: 200, body: { results: [] } };
+      if (method === 'POST' && url.includes('/crm/v3/objects/emails')) return { status: 201, body: { id: engagementId } };
+      return undefined;
+    });
+  }
+
+  it('happy path: resolve → send → record, in that order; receipt is logged:true with the engagement id and the send receipt verbatim (generic, codex P2)', async () => {
+    happyRoutes();
+    // an arbitrary provider receipt shape — the orchestrator is generic over it
+    const send = vi.fn(async () => ({ id: 'provider-msg-1', via: 'graph' }));
+
+    const result = await sendOutgoingEmailTracked(makeClient(), baseInput, send);
+
+    expect(result.sent).toBe(true);
+    expect(result.hubspot).toMatchObject({ logged: true, engagementId: 'engagement-t1', contactIds: ['contact-1'] });
+    expect(result.send).toEqual({ id: 'provider-msg-1', via: 'graph' });
+    expect(result.send.id).toBe('provider-msg-1'); // typed access — no cast needed
+    // resolve (contact search) happened BEFORE send; the engagement POST AFTER send
+    const searchIdx = captured.findIndex((c) => c.url.includes('/contacts/search'));
+    const emailIdx = captured.findIndex((c) => c.method === 'POST' && c.url.includes('/crm/v3/objects/emails'));
+    expect(searchIdx).toBeGreaterThanOrEqual(0);
+    expect(emailIdx).toBeGreaterThan(searchIdx);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('enforce (default): a resolve failure BLOCKS the send — throws stage:"resolve", send() never called, no engagement POST', async () => {
+    stubRoutedFetch();
+    addRoute((url, method) => {
+      if (method === 'POST' && url.includes('/crm/v3/objects/contacts/search')) return { status: 500, body: { message: 'hubspot down' } };
+      return undefined;
+    });
+    const send = vi.fn(async () => undefined);
+
+    let caught: unknown;
+    try { await sendOutgoingEmailTracked(makeClient(), baseInput, send); } catch (err) { caught = err; }
+
+    expect(caught).toBeInstanceOf(HubSpotEmailLogError);
+    expect((caught as HubSpotEmailLogError).stage).toBe('resolve');
+    expect(send).not.toHaveBeenCalled();
+    expect(captured.some((c) => c.url.includes('/crm/v3/objects/emails'))).toBe(false);
+  });
+
+  it('warn: a resolve failure lets the send proceed and the receipt carries logged:false + stage:"resolve"', async () => {
+    stubRoutedFetch();
+    addRoute((url, method) => {
+      if (method === 'POST' && url.includes('/crm/v3/objects/contacts/search')) return { status: 500, body: { message: 'hubspot down' } };
+      return undefined;
+    });
+    const send = vi.fn(async () => ({ messageId: 'graph-1' }));
+
+    const result = await sendOutgoingEmailTracked(makeClient(), { ...baseInput, mode: 'warn' }, send);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(result.sent).toBe(true);
+    expect(result.hubspot).toMatchObject({ logged: false, stage: 'resolve' });
+    expect((result.hubspot as any).error).toMatch(/fail-closed|resolve/i);
+  });
+
+  it('logExempt: sends with ZERO HubSpot calls; receipt says skipped:"exempt" with the reason', async () => {
+    stubRoutedFetch();
+    const send = vi.fn(async () => undefined);
+
+    const result = await sendOutgoingEmailTracked(makeClient(), { ...baseInput, logExempt: 'transactional do-not-reply' }, send);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(result.hubspot).toEqual({ logged: false, skipped: 'exempt', reason: 'transactional do-not-reply' });
+    expect(captured).toHaveLength(0);
+  });
+
+  it('logExempt that is only whitespace does NOT exempt (still resolves + records)', async () => {
+    happyRoutes('engagement-t2');
+    const result = await sendOutgoingEmailTracked(makeClient(), { ...baseInput, logExempt: '   ' }, async () => undefined);
+    expect(result.hubspot).toMatchObject({ logged: true, engagementId: 'engagement-t2' });
+  });
+
+  it('all-internal recipients: sends, no contact/engagement calls, receipt skipped:"all-internal"', async () => {
+    stubRoutedFetch();
+    const send = vi.fn(async () => undefined);
+
+    const result = await sendOutgoingEmailTracked(makeClient(), { ...baseInput, to: ['sarah@heritagefabrics.com'], cc: ['kevin@b.studio'] }, send);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(result.hubspot).toEqual({ logged: false, skipped: 'all-internal' });
+    expect(captured).toHaveLength(0);
+  });
+
+  it('send() throwing propagates and nothing is recorded (resolve ran, engagement POST never happened)', async () => {
+    happyRoutes();
+    const boom = new Error('graph 429');
+    await expect(sendOutgoingEmailTracked(makeClient(), baseInput, async () => { throw boom; })).rejects.toBe(boom);
+    expect(captured.some((c) => c.method === 'POST' && c.url.includes('/crm/v3/objects/emails'))).toBe(false);
+  });
+
+  it('record failure AFTER a successful send never throws — receipt is logged:false, stage:"record", contactIds populated', async () => {
+    stubRoutedFetch();
+    addRoute((url, method) => {
+      if (method === 'POST' && url.includes('/crm/v3/objects/contacts/search')) return { status: 200, body: { total: 1, results: [{ id: 'contact-1' }] } };
+      if (method === 'GET' && url.includes('/associations/companies')) return { status: 404, body: {} };
+      if (method === 'GET' && url.includes('/crm/v3/owners')) return { status: 200, body: { results: [] } };
+      if (method === 'POST' && url.includes('/crm/v3/objects/emails')) return { status: 400, body: { message: 'bad request' } };
+      return undefined;
+    });
+    const send = vi.fn(async () => undefined);
+
+    const result = await sendOutgoingEmailTracked(makeClient(), baseInput, send);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(result.sent).toBe(true);
+    expect(result.hubspot).toMatchObject({ logged: false, stage: 'record', contactIds: ['contact-1'] });
+    expect((result.hubspot as any).error).toMatch(/SENT but the HubSpot engagement create failed/);
   });
 });

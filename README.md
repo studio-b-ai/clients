@@ -93,6 +93,33 @@ between them. `{ skipped: 'all-internal' }` comes back with zero HubSpot
 calls when every recipient's domain is in `DEFAULT_INTERNAL_EMAIL_DOMAINS`
 (override via `internalDomains`).
 
+**Preferred entrypoint — `sendOutgoingEmailTracked`** wraps ANY send strategy (generic over its return)
+in the by-construction law (resolve → send → record) and returns one receipt:
+
+```ts
+import { sendOutgoingEmailTracked } from '@studio-b-ai/clients/hubspot/recipes';
+
+const receipt = await sendOutgoingEmailTracked(
+  hs,
+  { fromEmail, to, cc, subject, textBody, htmlBody /*, logExempt?, mode? */ },
+  () => ms.sendMessage({ to, cc, subject, body: htmlBody, userEmail: fromEmail }), // the pluggable send
+);
+// receipt = { sent: true, send, hubspot: { logged: true, engagementId, contactIds, ... }
+//         |  { logged: false, skipped: 'all-internal' | 'exempt' }
+//         |  { logged: false, stage: 'resolve' | 'record', error, contactIds } }
+```
+
+- `mode: 'enforce'` (default) — an unresolvable recipient throws
+  `HubSpotEmailLogError{stage:'resolve'}` BEFORE `send()` runs (nothing goes
+  out untracked). `mode: 'warn'` sends anyway and the receipt carries the error
+  (degrade mode; the caller alerts).
+- `logExempt: '<reason>'` — send with zero HubSpot calls (transactional
+  do-not-reply etc.); the reason rides in the receipt.
+- A `record` failure after a successful send never throws — the receipt says
+  `logged: false, stage: 'record'`; surface it loudly, never as success.
+- Owner attribution tries the exact sender, then the same local-part on each
+  internal domain (`ownerEmailCandidates` to override).
+
 ### Railway
 
 ```ts
