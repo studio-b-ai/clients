@@ -5,6 +5,13 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0](https://github.com/studio-b-ai/clients/compare/v1.2.5...v1.3.0) (2026-08-18)
+
+
+### Features
+
+* **hubspot:** outgoing-email CRM logging (findContactByEmail, logOutgoingEmail, resolve/record recipes) ([#43](https://github.com/studio-b-ai/clients/issues/43)) ([cd23e60](https://github.com/studio-b-ai/clients/commit/cd23e603de0b5d643acfb7e4b381f06f17fb6602))
+
 ## [1.2.5](https://github.com/studio-b-ai/clients/compare/v1.2.4...v1.2.5) (2026-08-17)
 
 
