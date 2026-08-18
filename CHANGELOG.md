@@ -5,6 +5,13 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0](https://github.com/studio-b-ai/clients/compare/v1.3.1...v1.4.0) (2026-08-18)
+
+
+### Features
+
+* **hubspot:** sendOutgoingEmailTracked — send-path-agnostic orchestrator (resolve → send → record) ([#47](https://github.com/studio-b-ai/clients/issues/47)) ([4427592](https://github.com/studio-b-ai/clients/commit/4427592fbd293506d65b9d20ecfbb24c32a58acf))
+
 ## [1.3.1](https://github.com/studio-b-ai/clients/compare/v1.3.0...v1.3.1) (2026-08-18)
 
 
