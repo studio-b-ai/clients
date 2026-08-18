@@ -56,6 +56,43 @@ const hs = new HubSpotClient({ accessToken: process.env.HUBSPOT_TOKEN! });
 const contact = await hs.contacts.getById('12345');
 ```
 
+#### Outgoing-email CRM logging
+
+`@studio-b-ai/clients/hubspot/recipes` exports `resolveOutgoingEmailRecipients`,
+`recordOutgoingEmail`, and `logOutgoingEmailToCrm` — a caller defaults
+`logToHubspot` ON for external recipients, so agent-sent business email is
+logged to the CRM by construction rather than by opt-in.
+
+Two-phase contract, so a caller can fail CLOSED before it ever sends:
+
+```ts
+import { HubSpotClient } from '@studio-b-ai/clients/hubspot';
+import { resolveOutgoingEmailRecipients, recordOutgoingEmail, HubSpotEmailLogError } from '@studio-b-ai/clients/hubspot/recipes';
+
+const hs = new HubSpotClient({ accessToken: process.env.HUBSPOT_TOKEN! });
+
+// 1. BEFORE sending — throws HubSpotEmailLogError{stage:'resolve'} if a
+//    recipient contact can't be resolved. Do not send on that path.
+const resolved = await resolveOutgoingEmailRecipients(hs, { to, cc });
+
+await sendViaGraph(/* ... */); // the caller's own send
+
+// 2. AFTER sending — throws HubSpotEmailLogError{stage:'record'} on failure;
+//    by this point the email is already sent, so report "sent but not
+//    logged" loudly with err.contactIds rather than pretending it worked.
+try {
+  await recordOutgoingEmail(hs, resolved, { fromEmail, subject, textBody });
+} catch (err) {
+  if (err instanceof HubSpotEmailLogError) { /* ... */ }
+}
+```
+
+`logOutgoingEmailToCrm(hs, { fromEmail, to, cc, subject, textBody, htmlBody })`
+composes both phases for a caller that doesn't interleave its own send
+between them. `{ skipped: 'all-internal' }` comes back with zero HubSpot
+calls when every recipient's domain is in `DEFAULT_INTERNAL_EMAIL_DOMAINS`
+(override via `internalDomains`).
+
 ### Railway
 
 ```ts
