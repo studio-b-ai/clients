@@ -120,7 +120,7 @@ export interface AcumaticaClientOptions {
    *   scoped key (`poolLockoutKey(baseUrl, username, tenant)`) before login
    *   — either one trips the guard.
    * - Set both keys on AccountLockedError (back-compat dual-write; legacy
-   *   global remains for webhook-router/lockout-guard.ts until it migrates
+   *   global remains for radio/lockout-guard.ts until it migrates
    *   to per-tenant guards).
    * If not provided, lockout guard is disabled (standalone mode).
    */
@@ -140,7 +140,7 @@ export interface AcumaticaClientOptions {
 const LOGIN_RETRY_DELAYS = [10_000, 30_000, 60_000];
 
 // Legacy global lockout keys. Kept as an alias during the single-tenant
-// transition so existing consumers (webhook-router/src/lib/lockout-guard.ts,
+// transition so existing consumers (radio/src/lib/lockout-guard.ts,
 // studiob packages/api/src/routes/maintenance.ts) continue to function.
 // AcumaticaClient dual-writes to both the legacy global key AND a scoped
 // per-(baseUrl, username, tenant) key, and reads "locked" if EITHER is set.
@@ -477,7 +477,7 @@ export class AcumaticaClient {
     if (!this.redis) return;
     try {
       // Increment both counters in parallel. Legacy global counter is kept in
-      // sync so webhook-router and maintenance.ts can still observe failure
+      // sync so radio and maintenance.ts can still observe failure
       // rates without knowing about the scoped key yet.
       const [scopedCur, legacyCur] = await Promise.all([
         this.redis.get(this.loginFailuresKey).catch(() => null),

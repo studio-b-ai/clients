@@ -75,7 +75,7 @@ describe('AcumaticaClient per-tenant lockout key', () => {
       tenant: 'Heritage Fabrics',
     });
 
-    // Fake Redis: only the legacy global key set — simulates webhook-router or
+    // Fake Redis: only the legacy global key set — simulates radio or
     // maintenance.ts manually pausing operations.
     const globalOnly: Record<string, string> = { 'acumatica:lockout': 'paused' };
     c.setRedisForTesting({

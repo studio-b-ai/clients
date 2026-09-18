@@ -1,7 +1,7 @@
 /**
  * Acumatica shared recipes -- standalone functions that take a client instance.
  *
- * Reusable patterns extracted from webhook-router, provisioning-agent,
+ * Reusable patterns extracted from radio, provisioning-agent,
  * and other services. Import as `@studio-b-ai/clients/acumatica/recipes`.
  */
 
