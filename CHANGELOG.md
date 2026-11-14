@@ -5,6 +5,13 @@ All notable changes to `@studio-b-ai/clients` are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1](https://github.com/studio-b-ai/clients/compare/v1.4.0...v1.4.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **acumatica:** wait for Redis ready before first checkout; recover from degraded mode ([#51](https://github.com/studio-b-ai/clients/issues/51)) ([03a2a24](https://github.com/studio-b-ai/clients/commit/03a2a24a43a11e227a06d81532c44918b1fee49e))
+
 ## [1.4.0](https://github.com/studio-b-ai/clients/compare/v1.3.1...v1.4.0) (2026-08-18)
 
 
