@@ -77,6 +77,11 @@ export interface PoolConfig {
   checkoutTimeoutMs?: number;
   /** Polling interval when waiting for a slot (ms). Default: 2_000 */
   pollIntervalMs?: number;
+  /**
+   * Max time a checkout waits for the Redis socket to be ready before falling
+   * back to degraded (in-memory) mode (ms). Default: 5_000
+   */
+  redisReadyTimeoutMs?: number;
   /** Background keepalive interval for idle sessions (ms). Default: 600_000 (10 min) */
   keepaliveMs?: number;
   /**
@@ -322,6 +327,7 @@ export class SessionPool {
   readonly staleCheckoutMs: number;
   readonly checkoutTimeoutMs: number;
   readonly pollIntervalMs: number;
+  readonly redisReadyTimeoutMs: number;
   readonly keepaliveMs: number;
   /** Defensive TTL on slot hashes in milliseconds. 0 = disabled. */
   readonly slotTtlMs: number;
@@ -370,6 +376,7 @@ export class SessionPool {
     this.staleCheckoutMs = config.staleCheckoutMs ?? 120_000;
     this.checkoutTimeoutMs = config.checkoutTimeoutMs ?? 30_000;
     this.pollIntervalMs = config.pollIntervalMs ?? 2_000;
+    this.redisReadyTimeoutMs = config.redisReadyTimeoutMs ?? 5_000;
     this.keepaliveMs = config.keepaliveMs ?? 600_000;
     this.slotTtlMs = config.slotTtlMs ?? 7_200_000; // 2h default
     this.convergeIdleToMaxSize = config.convergeIdleToMaxSize ?? false;
@@ -728,13 +735,14 @@ export class SessionPool {
       this.redis = new Redis(this.redisUrl, {
         lazyConnect: false,
         maxRetriesPerRequest: 1,
+        // Never give up reconnecting. A null return here would leave the
+        // client permanently closed and the pool degraded until restart,
+        // which splits seat accounting across pools on the same account.
         retryStrategy: (times: number) => {
-          if (times > 2) {
-            this.degraded = true;
-            this.log.warn('Session pool degraded: Redis connection failed');
-            return null;
+          if (times === 3) {
+            this.log.warn('Session pool: Redis still reconnecting');
           }
-          return Math.min(times * 500, 2000);
+          return Math.min(times * 500, 5_000);
         },
         enableOfflineQueue: false,
       });
@@ -746,6 +754,23 @@ export class SessionPool {
         }
       });
 
+      // Recover from degraded mode once the socket is usable again. Idle
+      // in-memory sessions are logged out so they stop holding seats that
+      // the shared Redis slot set cannot see. Checked-out degraded handles
+      // are logged out at checkin instead (see checkin()).
+      this.redis.on('ready', () => {
+        if (!this.degraded) return;
+        this.degraded = false;
+        let released = 0;
+        for (const [slotId, slot] of this.localSlots) {
+          if (slot.checkedOutBy !== '') continue;
+          this.localSlots.delete(slotId);
+          released++;
+          void this.logoutSession(slot.cookie).catch(() => {});
+        }
+        this.log.warn({ released }, 'Session pool recovered: Redis ready');
+      });
+
       return this.redis;
     } catch (err) {
       this.degraded = true;
@@ -755,6 +780,29 @@ export class SessionPool {
       );
       return null;
     }
+  }
+
+  /**
+   * Wait until the Redis socket can take commands. With enableOfflineQueue
+   * off, a command sent while ioredis is still connecting is rejected
+   * outright, so the first checkout after the client is created must wait.
+   * Returns false if the client is not ready within redisReadyTimeoutMs.
+   */
+  private async waitForRedisReady(redis: Redis): Promise<boolean> {
+    // pg-enum-drift-exempt: ioredis connection state, not a Postgres column
+    if (redis.status === 'ready') return true;
+    // Test doubles without an event interface are treated as connected.
+    if (typeof (redis as { once?: unknown }).once !== 'function') return true;
+    return new Promise<boolean>((resolve) => {
+      const done = (ok: boolean) => {
+        clearTimeout(timer);
+        redis.off('ready', onReady);
+        resolve(ok);
+      };
+      const onReady = () => done(true);
+      const timer = setTimeout(() => done(false), this.redisReadyTimeoutMs);
+      redis.once('ready', onReady);
+    });
   }
 
   /** Login to Acumatica and return session cookie string */
@@ -832,6 +880,15 @@ export class SessionPool {
 
     // Degraded mode: login directly, return handle
     if (!redis || this.degraded) {
+      return this.degradedCheckout();
+    }
+
+    if (!(await this.waitForRedisReady(redis))) {
+      this.degraded = true;
+      this.log.warn(
+        { timeoutMs: this.redisReadyTimeoutMs },
+        'Session pool degraded: Redis not ready within timeout',
+      );
       return this.degradedCheckout();
     }
 
@@ -1011,6 +1068,15 @@ export class SessionPool {
 
   /** Return a session slot to the pool */
   async checkin(handle: SessionHandle): Promise<void> {
+    if (handle.degraded && !this.degraded) {
+      // The pool recovered while this in-memory session was checked out.
+      // Don't keep it: Redis can't see it, so it would hold a seat the
+      // other pools on this account don't know about.
+      this.localSlots.delete(handle.slotId);
+      await this.logoutSession(handle.cookie).catch(() => {});
+      return;
+    }
+
     if (handle.degraded) {
       this.localSlots.set(handle.slotId, {
         cookie: handle.cookie,
