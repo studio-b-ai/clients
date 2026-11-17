@@ -25,6 +25,14 @@
  *      NOT in the :slots set, no cookie field, lastUsedAt older than
  *      staleCheckoutMs. Active cookied/in-set slots are never touched.
  *
+ * Login lockout backoff (2026-11-17): when Acumatica refuses a pool login
+ * (locked out or disabled), new logins pause for loginLockoutBackoffMs
+ * (default 60s). Checkouts during the pause throw AccountLockedError without
+ * logging in. In Redis mode the pool writes the shared lockout key with SET NX,
+ * so other replicas stop too and AcumaticaClient's longer key is never
+ * shortened. The breaker is not tripped, so recovery after a manual unlock
+ * stays fast.
+ *
  * Note: pre-2026-04-19 keys (account-only scope) are abandoned on upgrade.
  * They will expire naturally via the AcumaticaClient session TTL or can be
  * flushed manually with `redis-cli --scan --pattern 'acumatica:pool:*'`.
@@ -82,6 +90,8 @@ export interface PoolConfig {
    * back to degraded (in-memory) mode (ms). Default: 5_000
    */
   redisReadyTimeoutMs?: number;
+  /** How long new logins pause after Acumatica refuses a pool login as locked out or disabled (ms). Default: 60_000 */
+  loginLockoutBackoffMs?: number;
   /** Background keepalive interval for idle sessions (ms). Default: 600_000 (10 min) */
   keepaliveMs?: number;
   /**
@@ -329,6 +339,7 @@ export class SessionPool {
   readonly pollIntervalMs: number;
   readonly redisReadyTimeoutMs: number;
   readonly keepaliveMs: number;
+  readonly loginLockoutBackoffMs: number;
   /** Defensive TTL on slot hashes in milliseconds. 0 = disabled. */
   readonly slotTtlMs: number;
   /** When true, keepalive sheds excess idle slots down to maxSize (logout + evict). */
@@ -339,6 +350,12 @@ export class SessionPool {
   private serviceId: string;
   private redis: Redis | null = null;
   private degraded = false;
+  /** Epoch ms until which new logins are paused after a lockout refusal. */
+  private loginBlockedUntil = 0;
+  /** Message of the refusal that started the current pause. */
+  private loginBlockedReason = '';
+  /** Degraded-mode logins in flight; they count toward maxSize. */
+  private pendingLogins = 0;
   private log: Logger;
   /** Per-(baseUrl, account, company) Redis key prefix. */
   readonly keyPrefix: string;
@@ -378,6 +395,7 @@ export class SessionPool {
     this.pollIntervalMs = config.pollIntervalMs ?? 2_000;
     this.redisReadyTimeoutMs = config.redisReadyTimeoutMs ?? 5_000;
     this.keepaliveMs = config.keepaliveMs ?? 600_000;
+    this.loginLockoutBackoffMs = config.loginLockoutBackoffMs ?? 60_000;
     this.slotTtlMs = config.slotTtlMs ?? 7_200_000; // 2h default
     this.convergeIdleToMaxSize = config.convergeIdleToMaxSize ?? false;
     this.log = config.logger ?? pino({ name: `session-pool:${config.account}` });
@@ -669,7 +687,13 @@ export class SessionPool {
     try {
       slotIds = await redis.smembers(slotsKey(this.keyPrefix));
     } catch (err) {
-      if (this.isRedisConnectionError(err)) this.degraded = true;
+      if (this.isRedisConnectionError(err)) {
+        this.degraded = true;
+        this.log.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Converge: Redis connection error during smembers — pool now degraded',
+        );
+      }
       return;
     }
     if (slotIds.length <= this.maxSize) return; // cheap pre-check; the Lua re-guards atomically per evict
@@ -689,6 +713,10 @@ export class SessionPool {
       } catch (err) {
         if (this.isRedisConnectionError(err)) {
           this.degraded = true;
+          this.log.warn(
+            { err: err instanceof Error ? err.message : String(err) },
+            'Converge: Redis connection error during evict-if-idle eval — pool now degraded',
+          );
           return;
         }
         this.log.debug(
@@ -830,6 +858,9 @@ export class SessionPool {
           'Acumatica account locked out during pool login.',
         );
       }
+      if (res.statusCode === 500 && text.toLowerCase().includes('account is disabled')) {
+        throw new AccountLockedError('Acumatica account disabled during pool login.');
+      }
       throw new Error(`Pool login failed: HTTP ${res.statusCode} — ${text.slice(0, 200)}`);
     }
 
@@ -840,6 +871,35 @@ export class SessionPool {
         ? [setCookieHeader]
         : [];
     return setCookies.map((c) => c.split(';')[0]).join('; ');
+  }
+
+  /** Logs in; a lockout refusal pauses further logins before rethrowing. */
+  private async loginGuarded(redis: Redis | null): Promise<string> {
+    try {
+      return await this.loginToAcumatica();
+    } catch (err) {
+      if (err instanceof AccountLockedError) await this.blockLogins(err.message, redis);
+      throw err;
+    }
+  }
+
+  private async blockLogins(reason: string, redis: Redis | null): Promise<void> {
+    const until = Date.now() + this.loginLockoutBackoffMs;
+    this.loginBlockedUntil = until;
+    this.loginBlockedReason = reason;
+    this.log.warn(
+      { account: this.account, backoffMs: this.loginLockoutBackoffMs, reason },
+      'Pool login refused by Acumatica — pausing new logins',
+    );
+    this.emit('circuit_trip', `Pool login refused — new logins paused ${this.loginLockoutBackoffMs}ms: ${reason}`);
+    if (redis && !this.degraded) {
+      try {
+        // NX: never shorten a longer lockout key AcumaticaClient already set (EX 600).
+        await redis.set(this.lockoutKey, new Date(until).toISOString(), 'PX', this.loginLockoutBackoffMs, 'NX');
+      } catch (err) {
+        this.log.debug({ err: (err as Error).message }, 'Could not write shared lockout key');
+      }
+    }
   }
 
   /**
@@ -873,6 +933,12 @@ export class SessionPool {
     if (this.circuitBreaker.isOpen) {
       throw new Error(
         `Circuit breaker open for account "${this.account}": ${this.circuitBreaker.reason}`,
+      );
+    }
+
+    if (Date.now() < this.loginBlockedUntil) {
+      throw new AccountLockedError(
+        `Pool logins paused for account "${this.account}" until ${new Date(this.loginBlockedUntil).toISOString()}: ${this.loginBlockedReason}`,
       );
     }
 
@@ -959,7 +1025,7 @@ export class SessionPool {
     if (activeCount < this.maxSize) {
       // Login and create a new slot.
       // Same synchronous-throw guard for CREATE_SLOT_LUA eval().
-      const cookie = await this.loginToAcumatica();
+      const cookie = await this.loginGuarded(redis);
       const newSlotId = `slot-${randomUUID().slice(0, 8)}`;
       const now = String(Date.now());
       const ttlSeconds = this.slotTtlMs > 0 ? String(Math.ceil(this.slotTtlMs / 1000)) : '0';
@@ -1308,8 +1374,15 @@ export class SessionPool {
       }
 
       // Under capacity — login and create new slot
-      if (this.localSlots.size < this.maxSize) {
-        const cookie = await this.loginToAcumatica();
+      // In-flight logins count toward capacity so concurrent checkouts can't overshoot maxSize.
+      if (this.localSlots.size + this.pendingLogins < this.maxSize) {
+        this.pendingLogins++;
+        let cookie: string;
+        try {
+          cookie = await this.loginGuarded(null);
+        } finally {
+          this.pendingLogins--;
+        }
         const slotId = `degraded-${randomUUID().slice(0, 8)}`;
         this.localSlots.set(slotId, {
           cookie,
