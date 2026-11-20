@@ -7,7 +7,7 @@
  * still 200s, the caller sees a plausible response, and only the end-to-end behaviour is
  * wrong.
  *
- * Live incident 2026-08-16 (webhook-router#608/#609/#610): a consumer pinned to a client
+ * Live incident 2026-08-16 (radio#608/#609/#610): a consumer pinned to a client
  * version whose search body omitted `after` re-fetched page 1 ten times (`paging.next.after`
  * came back identical every call because the cursor never reached the wire), walked 1,000
  * phantom "twins" and blew the Acumatica hourly call budget (742/500). The existing
@@ -144,7 +144,7 @@ describe('search body completeness — every documented HubSpotSearchOpts field 
 // 2. Named regression — the paging cursor ADVANCES on the wire
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('paging `after` reaches the wire (2026-08-16 webhook-router#608 regression)', () => {
+describe('paging `after` reaches the wire (2026-08-16 radio#608 regression)', () => {
   it('a two-page walk sends page 1\'s paging.next.after in page 2\'s body', async () => {
     // Page 1 answers with a cursor; the walker feeds it back as `after`.
     stubFetch({ total: 250, results: [{ id: '1' }], paging: { next: { after: '100' } } });

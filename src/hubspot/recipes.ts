@@ -1,7 +1,7 @@
 /**
  * HubSpot shared recipes -- standalone functions that take a client instance.
  *
- * Reusable patterns extracted from webhook-router sync workers.
+ * Reusable patterns extracted from radio sync workers.
  * Import as `@studio-b-ai/clients/hubspot/recipes`.
  */
 

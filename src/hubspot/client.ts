@@ -235,7 +235,7 @@ export class HubSpotClient {
     // (every HubSpotSearchOpts field survives buildSearchBody) — the former
     // always-on console.debug of the full body is gone: it bypassed consumers'
     // structured loggers and printed a multi-line JSON blob to stdout on EVERY
-    // generic search (webhook-router runs one per upsert lookup).
+    // generic search (radio runs one per upsert lookup).
     const body = this.buildSearchBody(opts, []);
     return this.fetch<any>('POST', `/crm/v3/objects/${objectType}/search`, body);
   }
